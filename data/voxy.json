@@ -1,0 +1,77 @@
+{
+  "_comment": "Voxy amp slot specs — used by the ranker to score each tube per slot (0–5 stars). See tubehunter.py score_for_slot() for how these fields feed the scoring rubric. Edit freely.",
+  "amp": {
+    "name": "Voxy",
+    "topology": "single-ended, ~4 W, AC4-inspired (push-pull optional if V2p_B is populated)",
+    "b_plus_v": 305,
+    "heater_supply": {
+      "type": "buck-boost, per-rail",
+      "v_max": 37,
+      "max_distinct_rails": 3,
+      "existing_rails_v": [6.3, 13.0],
+      "existing_rails_note": "EF94 uses 6.3 V, PCL86 uses 13 V. A tube whose heater matches either of these joins an existing rail and doesn't cost a new one; anything else at ≤37 V requires a third rail (still fine — the max is three)."
+    },
+    "opt": "Hammond 1750C SE (~5k primary) — SE only; push-pull would need a different OPT",
+    "current_tubes": ["EF94", "PCL86"]
+  },
+  "slots": {
+    "V1": {
+      "label": "V1 · Pentode preamp",
+      "role": "Front-end pentode voltage gain into HOWL pot",
+      "current_tube": "EF94",
+      "category": "pentode_pre",
+      "socket": "B7G",
+      "prefers_cutoff": "sharp",
+      "notes": "Runs off B+3 through 100k plate R; 470k screen feed intentionally starves for headroom. Remote-cutoff pentodes distort audio — avoid. EF86 is a rewire (noval socket) but the sonic prize."
+    },
+    "V2t": {
+      "label": "V2 triode · Boost",
+      "role": "Triode section drives the cold-clip / SIZZLE. Currently the PCL86 triode.",
+      "current_tube": "PCL86 (triode section)",
+      "category": "triode_pre",
+      "socket": "noval",
+      "mu_range": [30, 100],
+      "notes": "Standalone triode preamp fits if you split the PCL86 into two envelopes. 12AX7 family = drop-in socket; heater rail is buck-boost so 12.6 V is fine."
+    },
+    "V2p": {
+      "label": "V2 pentode · SE output",
+      "role": "SE power pentode into 1750C. ~5 W plate dissipation target at 305 V.",
+      "current_tube": "PCL86 (pentode section)",
+      "category": "power",
+      "socket": "noval",
+      "va_range": [250, 350],
+      "pd_range": [5, 15],
+      "notes": "SE class-A into ~5k primary favors EL84/6BQ5-class. 6V6 fits electrically but octal (different socket). >15W diss is overkill and wastes heater budget."
+    },
+    "combo": {
+      "label": "Combo · full V2 drop-in",
+      "role": "Triode preamp + SE power pentode in one envelope — direct PCL86 replacement.",
+      "current_tube": "PCL86",
+      "category": "combo",
+      "socket": "noval",
+      "va_range": [250, 350],
+      "pd_range": [4, 12],
+      "mu_range": [30, 100],
+      "notes": "13 V heater = joins the PCL86 rail. 6.3 V variants (ECL82/86, 6BM8, 6GW8) work fine but sit on the EF94 rail instead."
+    },
+    "PI": {
+      "label": "PI · Cathodyne phase inverter",
+      "role": "OPTIONAL — one triode section as a split-load (cathodyne) PI. Sends anti-phase signal to a push-pull output pair.",
+      "current_tube": "(none — Voxy is SE by default)",
+      "category": "triode_pre",
+      "socket": "noval",
+      "mu_ideal_range": [15, 30],
+      "notes": "Cathodyne gain ≈ 1; low-µ triodes (12AU7, 6SN7) give the cleanest split. High-µ (12AX7) works and is the Fender Champ/Princeton PI, but with less headroom. Only relevant if you're building the push-pull option."
+    },
+    "V2p_B": {
+      "label": "V2 · PP second power valve",
+      "role": "OPTIONAL — second power tube for push-pull output (replaces SE with PP; needs a PP OPT swap).",
+      "current_tube": "(none — Voxy is SE by default)",
+      "category": "power",
+      "socket": "noval",
+      "va_range": [250, 350],
+      "pd_range": [5, 15],
+      "notes": "Same tube type as V2p. Look for in-stock so a matched pair is available. Uses same heater rail as V2p — no extra rail cost when both output tubes match."
+    }
+  }
+}

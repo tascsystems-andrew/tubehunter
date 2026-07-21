@@ -1,0 +1,85 @@
+#!/bin/bash
+# TubeHunter launcher — invoked when the .app is opened from Finder or the Dock.
+#
+# Flow:
+#   1. Find the tubehunter.py code (next to the .app first, then ~/TubeHunter/)
+#   2. Find a Python 3
+#   3. If a server is already answering on 127.0.0.1:8765, just open the browser
+#   4. Otherwise exec Python — it runs the server foreground and opens the browser
+#      itself. Quitting the app via the Dock kills Python, which stops the server.
+
+set -u
+
+alert() {
+    local title="$1"; shift
+    local msg="$*"
+    /usr/bin/osascript -e "display alert \"$title\" message \"$msg\" as critical" >/dev/null 2>&1 || true
+}
+
+# Give the launcher a chance to see PATH entries the way most users install Python.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/Library/Frameworks/Python.framework/Versions/3.11/bin:/Library/Frameworks/Python.framework/Versions/3.12/bin:/Library/Frameworks/Python.framework/Versions/3.13/bin:/usr/bin:/bin"
+
+# --- locate the code ------------------------------------------------------
+LAUNCHER_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="$(cd "$LAUNCHER_DIR/../.." && pwd)"
+PARENT_DIR="$(dirname "$APP_DIR")"
+
+CODE_DIR=""
+for candidate in "$PARENT_DIR" "$HOME/TubeHunter" "/Applications/TubeHunter" "$HOME/Documents/TubeHunter"; do
+    if [ -f "$candidate/tubehunter.py" ]; then
+        CODE_DIR="$candidate"
+        break
+    fi
+done
+
+if [ -z "$CODE_DIR" ]; then
+    alert "TubeHunter code not found" \
+        "Expected tubehunter.py in ~/TubeHunter/ or next to the .app bundle. Please make sure the code directory exists."
+    exit 1
+fi
+
+# --- locate Python 3 ------------------------------------------------------
+# Prefer a Python that also has pywebview installed so we get the native window.
+# Fall back to any Python 3.7+ if none of them have pywebview.
+CANDIDATES=(
+    /Library/Frameworks/Python.framework/Versions/3.11/bin/python3
+    /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+    /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+    /opt/homebrew/bin/python3
+    /usr/local/bin/python3
+    python3
+    /usr/bin/python3
+)
+
+PY=""
+PY_FALLBACK=""
+for cand in "${CANDIDATES[@]}"; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    if ! "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,7) else 1)' 2>/dev/null; then
+        continue
+    fi
+    if [ -z "$PY_FALLBACK" ]; then PY_FALLBACK="$cand"; fi
+    if "$cand" -c 'import webview' 2>/dev/null; then
+        PY="$cand"
+        break
+    fi
+done
+[ -z "$PY" ] && PY="$PY_FALLBACK"
+
+if [ -z "$PY" ]; then
+    alert "Python 3 not found" \
+        "TubeHunter needs Python 3.7 or newer. Install it from python.org or Homebrew and try again."
+    exit 1
+fi
+
+cd "$CODE_DIR"
+
+# --- if a server is already running on 8765, just focus/open a new window --
+if /usr/bin/curl -sf --max-time 1 http://127.0.0.1:8765/api/data >/dev/null 2>&1; then
+    /usr/bin/open "http://127.0.0.1:8765/"
+    exit 0
+fi
+
+# --- otherwise run Python in the foreground so the Dock knows we're alive --
+# Python opens the browser itself via webbrowser.open() as it boots.
+exec "$PY" tubehunter.py
