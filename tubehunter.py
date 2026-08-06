@@ -443,6 +443,24 @@ def target_from_filament_studio(doc: dict) -> dict:
             sid = f"{base}_{n}"; n += 1
         slots[sid] = spec
 
+    # The PSU block names its rectifier ("EZ81", "5Y3", …) — that's a tube slot
+    # too. Solid-state markers are skipped.
+    rect_type = (((doc.get("psu") or {}).get("rectifier") or {}).get("type") or "").strip()
+    if rect_type and rect_type.lower() not in {"ss", "solid-state", "solidstate",
+                                               "silicon", "diode", "diodes", "bridge", "none"}:
+        slots["rectifier"] = {
+            "label": f"Rectifier · {rect_type}",
+            "role": f"Imported from the Filament Studio PSU — designed around {rect_type}.",
+            "accepts": {"rectifier": 2.0},
+            "requires_element": ["diode"],
+            "socket": {"preferred": ["noval", "octal"], "pref_score": 1.0,
+                       "acceptable": {"B7G": 0.7, "UX4": 0.4, "loctal": 0.4}},
+            "notes": (f"PSU rectifier from the design ({rect_type}). Any full-wave tube "
+                      "rectifier with compatible current rating fits; solid-state is "
+                      "always the drop-in alternative."),
+            "_filament": {"psu_rectifier": rect_type},
+        }
+
     b_plus = None
     for s in tube_stages:
         b_plus = (s.get("rails") or {}).get("bPlus_V") or b_plus
@@ -3468,6 +3486,33 @@ def main():
         # thread (WKWebView requires it on macOS). Closing the window exits the
         # process, which stops the server.
         threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        # Cocoa names the app menu after the *executable's* bundle — which is
+        # Homebrew's Python.app, so the menu bar says "Python". Rewriting the
+        # main bundle's in-memory info dictionary before the menu is built makes
+        # it say TubeHunter, and the Dock icon follows the same treatment. This
+        # is the standard interpreter-hosted-app fix short of freezing a real
+        # bundle with py2app/PyInstaller.
+        try:
+            from Foundation import NSBundle  # type: ignore
+            info = NSBundle.mainBundle().localizedInfoDictionary() \
+                   or NSBundle.mainBundle().infoDictionary()
+            if info is not None:
+                info["CFBundleName"] = "TubeHunter"
+                info["CFBundleDisplayName"] = "TubeHunter"
+        except Exception:
+            pass
+        try:
+            from AppKit import NSApplication, NSImage  # type: ignore
+            for icns in (Path("/Applications/TubeHunter.app/Contents/Resources/TubeHunter.icns"),
+                         HERE / "TubeHunter.app/Contents/Resources/TubeHunter.icns"):
+                if icns.exists():
+                    img = NSImage.alloc().initWithContentsOfFile_(str(icns))
+                    if img:
+                        NSApplication.sharedApplication().setApplicationIconImage_(img)
+                    break
+        except Exception:
+            pass
 
         # JS-callable API: WKWebView has no downloads handler, so clicking a
         # blob-download link navigates the window instead of saving. Route the

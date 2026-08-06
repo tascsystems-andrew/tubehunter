@@ -144,6 +144,32 @@
       "pd_over_score": 0.3,
       "va_min": 270,
       "prefer_hv": 6.3
+    },
+    "rectifier": {
+      "label": "Rectifier \u00b7 EZ81",
+      "role": "Imported from the Filament Studio PSU \u2014 designed around EZ81.",
+      "accepts": {
+        "rectifier": 2.0
+      },
+      "requires_element": [
+        "diode"
+      ],
+      "socket": {
+        "preferred": [
+          "noval",
+          "octal"
+        ],
+        "pref_score": 1.0,
+        "acceptable": {
+          "B7G": 0.7,
+          "UX4": 0.4,
+          "loctal": 0.4
+        }
+      },
+      "notes": "PSU rectifier from the design (EZ81). Any full-wave tube rectifier with compatible current rating fits; solid-state is always the drop-in alternative.",
+      "_filament": {
+        "psu_rectifier": "EZ81"
+      }
     }
   }
 }
