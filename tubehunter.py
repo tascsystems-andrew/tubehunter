@@ -369,13 +369,21 @@ def target_from_filament_studio(doc: dict) -> dict:
         mu = model.get("mu")
         qp_diss = q.get("Pdiss_W") or 0
 
-        # The block type names the job when it can: "pa-se"/"pa-pp" are power-amp
-        # blocks, "…-pre" blocks are preamps. Unknown block types fall back to a
-        # dissipation heuristic: a stage burning real watts is doing power work.
+        # Power/preamp classification, most-authoritative first:
+        #   1. explicit per-stage `role` field (offered for a future schema bump —
+        #      pre-wired so it wins the moment Filament Studio emits it)
+        #   2. the `pa-*` block-type prefix (committed external contract,
+        #      2026-08-06: never renamed, never used by a non-power block)
+        #   3. dissipation heuristic for anything older or odder
+        role = (s.get("role") or "").strip().lower()
         btype = (s.get("type") or "").lower()
-        if btype.startswith("pa"):
+        if role in ("power",):
             is_power = True
-        elif btype.endswith("-pre") or "pre" in btype:
+        elif role in ("preamp", "pi"):
+            is_power = False
+        elif btype.startswith("pa"):
+            is_power = True
+        elif "pre" in btype:
             is_power = False
         else:
             is_power = bool(pdiss and pdiss >= 6 and qp_diss >= 1.5)
@@ -443,11 +451,14 @@ def target_from_filament_studio(doc: dict) -> dict:
             sid = f"{base}_{n}"; n += 1
         slots[sid] = spec
 
-    # The PSU block names its rectifier ("EZ81", "5Y3", …) — that's a tube slot
-    # too. Solid-state markers are skipped.
-    rect_type = (((doc.get("psu") or {}).get("rectifier") or {}).get("type") or "").strip()
-    if rect_type and rect_type.lower() not in {"ss", "solid-state", "solidstate",
-                                               "silicon", "diode", "diodes", "bridge", "none"}:
+    # PSU rectifier per the Filament Studio contract (2026-08-06): the type field
+    # is a closed key set where 'SS' — exactly — means solid-state; any unknown
+    # key is a future tube rectifier. The field is meaningless when the PSU is
+    # direct-DC (source == 'dc') or wasn't modeled at all (enabled == false).
+    psu = doc.get("psu") or {}
+    rect_type = ((psu.get("rectifier") or {}).get("type") or "").strip()
+    if (psu.get("enabled") and psu.get("source") != "dc"
+            and rect_type and rect_type.upper() != "SS"):
         slots["rectifier"] = {
             "label": f"Rectifier · {rect_type}",
             "role": f"Imported from the Filament Studio PSU — designed around {rect_type}.",
@@ -935,11 +946,15 @@ INDEX_HTML = r"""<!doctype html>
   /* toolbar */
   #frame {
     background: var(--frame-bg);
-    border-bottom: 1px solid var(--border);
-    box-shadow: var(--frame-shadow);
-    padding: 8px 12px;
-    display: flex; align-items: center; gap: 10px;
+    padding: 6px 12px;
+    display: flex; align-items: center; gap: 8px 10px;
+    flex-wrap: wrap;
     flex: none;
+  }
+  /* Controls wrap as units — no mid-button line breaks, no truncated labels. */
+  #frame button, #frame label, .chassis-toggle, .cart-setup,
+  .filter-group .filter-label, .build-picker, .target-picker {
+    white-space: nowrap;
   }
   #frame .title { font-weight: 600; font-size: 13px; }
   #frame .spacer { flex: 1; }
@@ -953,7 +968,8 @@ INDEX_HTML = r"""<!doctype html>
   #frame button:disabled { color: #999; cursor: not-allowed; }
   #frame .meta { color: var(--muted); font-size: 11px; }
   #search {
-    padding: 3px 8px; font: inherit; width: 180px;
+    padding: 3px 8px; font: inherit;
+    flex: 1 1 140px; min-width: 90px; max-width: 200px;
     border: 1px solid var(--border); border-radius: 10px;
     background: #fff;
   }
@@ -973,9 +989,9 @@ INDEX_HTML = r"""<!doctype html>
      positioned divs; the <input>s have transparent runnable-tracks and only
      contribute their thumbs. */
   .dual-range {
-    position: relative; width: 280px; height: 24px;
+    position: relative; width: clamp(170px, 19vw, 280px); height: 24px;
   }
-  .dual-range.single-range-wrap { width: 200px; }
+  .dual-range.single-range-wrap { width: clamp(130px, 12vw, 200px); }
   .dual-range .track {
     position: absolute; left: 0; right: 0; top: 9px; height: 6px;
     background: #b6bcc4; border-radius: 3px;
@@ -1094,6 +1110,45 @@ INDEX_HTML = r"""<!doctype html>
     text-decoration: none;
   }
   .cart-setup:hover { background: #e0c8ff; text-decoration: none; }
+  #frame { position: relative; padding-right: 148px; }
+  #statusbar {
+    background: var(--frame-bg);
+    border-bottom: 1px solid var(--border);
+    box-shadow: var(--frame-shadow);
+    padding: 0 12px 5px;
+    display: flex; align-items: center; gap: 10px;
+    flex: none;
+  }
+  #statusbar .meta { margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .refresh-pin { position: absolute; top: 6px; right: 12px; }
+  .filter-pop-wrap { position: relative; }
+  /* Wide windows: sliders live inline exactly as before — the Filters button
+     doesn't exist until the window actually gets tight. */
+  @media (min-width: 1400px) {
+    #filtersBtn { display: none; }
+    #filterPanel, #filterPanel[hidden] {
+      display: flex !important; position: static;
+      flex-direction: row; align-items: center; gap: 10px;
+      background: transparent; border: 0; box-shadow: none; padding: 0;
+    }
+  }
+  /* Below the fit point: sliders collapse into a click-to-open panel instead of
+     shoving core controls around. */
+  @media (max-width: 1399px) {
+    #filtersBtn.active {
+      background: linear-gradient(180deg, #6c8bd6, #3a63b8);
+      color: #fff; border-color: #2a4dab;
+    }
+    #filterPanel {
+      position: absolute; top: 28px; left: 0; z-index: 600;
+      background: #fff; border: 1px solid var(--border); border-radius: 6px;
+      box-shadow: 0 10px 28px rgba(0,0,0,0.22);
+      padding: 12px 16px; display: flex; flex-direction: column; gap: 12px;
+    }
+    #filterPanel[hidden] { display: none; }
+    #filterPanel .dual-range { width: 280px; }
+    #filterPanel .dual-range.single-range-wrap { width: 200px; }
+  }
   .target-picker {
     display: flex; align-items: center; gap: 5px; font-size: 11px;
     background: #fff; border: 1px solid var(--border); border-radius: 4px;
@@ -1214,6 +1269,12 @@ INDEX_HTML = r"""<!doctype html>
     border-top: 1px solid #b6c8e8; font-size: 12px;
   }
 
+  /* Narrow-window tier: shed the decorative chips first, then give the meta
+     line its own row instead of squeezing the controls. */
+  @media (max-width: 1000px) {
+    .build-picker select { max-width: 110px; }
+  }
+
   /* Cart-copy modal — the two-step user-gesture workflow */
   .cart-overlay {
     position: fixed; inset: 0; z-index: 9999;
@@ -1328,10 +1389,13 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <div id="frame">
     <div class="title">TubeHunter</div>
-    <div class="target-picker" id="targetPicker"></div>
+    <div class="build-picker" id="buildPicker"></div>
     <input id="search" placeholder="Filter (e.g. EF86, noval, combo)">
     <label class="chassis-toggle"><input type="checkbox" id="chassisToggle" checked> Fits chassis</label>
     <label class="chassis-toggle"><input type="checkbox" id="stockToggle" checked> In stock only</label>
+    <div class="filter-pop-wrap">
+      <button id="filtersBtn" title="Price and fit filters">Filters ▾</button>
+      <div id="filterPanel" hidden>
     <div class="filter-group" id="priceFilter">
       <span class="filter-label">Price <span id="priceReadout">— – —</span></span>
       <div class="dual-range">
@@ -1349,9 +1413,11 @@ INDEX_HTML = r"""<!doctype html>
         <input type="range" id="starsSlider" min="0" max="5" step="0.5" value="0">
       </div>
     </div>
-    <button id="refresh">Refresh from web</button>
-    <div class="spacer"></div>
-    <div class="build-picker" id="buildPicker"></div>
+      </div>
+    </div>
+    <button id="refresh" class="refresh-pin">Refresh from web</button>
+  </div>
+  <div id="statusbar">
     <a href="/bookmarklet" target="_blank" rel="noopener" class="cart-setup" title="One-time setup for the store-cart bookmarklet">🛒 cart setup</a>
     <button id="exportCsv" class="export-btn" title="Download all crawled inventory as CSV (regardless of chassis fit, filters, or classification)">Export CSV</button>
     <div class="meta" id="meta">loading…</div>
@@ -1491,6 +1557,7 @@ async function boot() {
   renderBuildPicker();
   renderSidebar();
   applyFilter();
+  ensureBuildTarget();
   document.getElementById("refresh").addEventListener("click", refresh);
   document.getElementById("search").addEventListener("input", e => {
     state.search = e.target.value.trim().toLowerCase();
@@ -1507,6 +1574,25 @@ async function boot() {
     applyFilter();
   });
   document.getElementById("exportCsv").addEventListener("click", exportInventoryCsv);
+  initFilterPopover();
+}
+
+function initFilterPopover() {
+  const btn = document.getElementById("filtersBtn");
+  const panel = document.getElementById("filterPanel");
+  if (!btn || !panel) return;
+  btn.addEventListener("click", e => { e.stopPropagation(); panel.hidden = !panel.hidden; });
+  panel.addEventListener("click", e => e.stopPropagation());
+  document.addEventListener("click", () => { if (!panel.hidden) panel.hidden = true; });
+}
+
+function updateFilterBadge() {
+  const btn = document.getElementById("filtersBtn");
+  if (!btn) return;
+  const active = (state.minStars > 0) ||
+                 (state.priceMin > 0 || (state.priceCeil && state.priceMax < state.priceCeil));
+  btn.classList.toggle("active", !!active);
+  btn.textContent = active ? "Filters ●" : "Filters ▾";
 }
 
 /* ==================== AMP TARGETS ==================== */
@@ -1518,29 +1604,8 @@ async function loadTarget() {
   } catch (e) {
     state.target = {name: "No target", slots: [], available: []};
   }
-  renderTargetPicker();
+  renderBuildPicker();
   document.title = "TubeHunter · " + (state.target?.name || "");
-}
-
-function renderTargetPicker() {
-  const el = document.getElementById("targetPicker");
-  if (!el) return;
-  const t = state.target || {};
-  const opts = (t.available || [])
-    .map(a => `<option value="${escapeHtml(a.id)}"${a.id === t.active ? " selected" : ""}>`
-            + `${escapeHtml(a.name)} (${a.slot_count})</option>`)
-    .join("");
-  const chassis = (t.chassis?.sockets || []).join(", ");
-  el.innerHTML = `
-    <span class="tp-label">Amp:</span>
-    <select id="targetSelect" title="${escapeHtml(t.description || "")}">${opts}</select>
-    <button id="targetImport" title="Import an amp design exported from Filament Studio">import…</button>
-    <span class="tp-chassis" title="Sockets this chassis accepts">${escapeHtml(chassis)}</span>
-  `;
-  const sel = document.getElementById("targetSelect");
-  if (sel) sel.addEventListener("change", e => selectTarget(e.target.value));
-  const imp = document.getElementById("targetImport");
-  if (imp) imp.addEventListener("click", importTargetDialog);
 }
 
 async function selectTarget(id) {
@@ -1561,7 +1626,7 @@ async function selectTarget(id) {
   }
   await load();
   document.title = "TubeHunter · " + (state.target?.name || "");
-  renderTargetPicker(); renderHead(); renderSidebar(); applyFilter(); clearDetail();
+  renderBuildPicker(); renderHead(); renderSidebar(); applyFilter(); clearDetail();
   flashToast("Now scoring for " + state.target.name);
 }
 
@@ -1599,9 +1664,14 @@ async function importTargetDialog() {
     state.target = j;
     state.sortKey = "voxy_overall";
     state.filter = {kind: "all"};
+    // The imported amp gets its own build immediately (amp ≡ build) unless one
+    // already points at this target.
+    let build = Object.values(state.builds).find(b => b.targetId === j.active);
+    if (!build) { createBuild(j.name); }
+    else { state.activeBuildId = build.id; saveBuilds(); }
     await load();
     document.title = "TubeHunter · " + (state.target?.name || "");
-    renderTargetPicker(); renderHead(); renderSidebar(); applyFilter(); clearDetail();
+    renderBuildPicker(); renderHead(); renderSidebar(); applyFilter(); clearDetail();
     alert(`Imported "${j.name}" with ${(j.slots || []).length} slot(s).\n\n`
         + `Inventory is now scored against it. Chassis sockets were imported permissively — `
         + `edit data/targets/${j.active}.json to match your real chassis.`);
@@ -1744,6 +1814,7 @@ function initPriceFilter() {
     state.priceMax = sliderPosToPrice(b);
     paintPriceFill();
     updatePriceReadout();
+    updateFilterBadge();
     renderSidebar();
     applyFilter();
   };
@@ -1781,6 +1852,7 @@ function initStarsFilter() {
     fill.style.left = "0%";
     fill.style.right = (100 - pct) + "%";
     document.getElementById("starsReadout").innerHTML = renderStarsCompact(state.minStars);
+    updateFilterBadge();
     renderSidebar();
     applyFilter();
   };
@@ -1881,7 +1953,7 @@ function renderSidebar() {
     }
   }
   // Builds section (playlists) — one entry per saved build, plus a "+ New" action.
-  groups.push({header: "Builds"});
+  groups.push({header: "Amps"});
   for (const b of Object.values(state.builds)) {
     groups.push({
       label: (b.id === state.activeBuildId ? "★ " : "") + b.name,
@@ -1889,7 +1961,7 @@ function renderSidebar() {
       count: b.envelopes.length,
     });
   }
-  groups.push({label: "+ New build", key: {kind: "new-build"}, count: ""});
+  groups.push({label: "+ New amp", key: {kind: "new-build"}, count: ""});
   el.innerHTML = "";
   groups.forEach(g => {
     if (g.header) {
@@ -1907,8 +1979,10 @@ function renderSidebar() {
         return;
       }
       if (g.key.kind === "build") {
-        // clicking a build in the sidebar: activate it, show its tubes filtered, open the build drawer
+        // clicking an amp in the sidebar: activate it (and its target), filter
+        // to its tubes, open the build drawer
         setActiveBuild(g.key.val);
+        ensureBuildTarget();
         state.filter = g.key;
         viewBuild(g.key.val);
       } else {
@@ -2184,7 +2258,10 @@ function loadBuilds() {
     const d = JSON.parse(raw);
     state.builds = d.builds || {};
     // migrate every build in place so the rest of the code only sees `envelopes`
-    for (const id of Object.keys(state.builds)) migrateBuild(state.builds[id]);
+    for (const id of Object.keys(state.builds)) {
+      const b = migrateBuild(state.builds[id]);
+      if (!b.targetId) b.targetId = state.target?.active || null;
+    }
     state.activeBuildId = d.activeBuildId && state.builds[d.activeBuildId] ? d.activeBuildId : null;
     saveBuilds();
   } catch (e) { /* ignore */ }
@@ -2197,7 +2274,8 @@ function newBuildId() {
 function createBuild(name) {
   const id = newBuildId();
   const n = (name || "").trim() || `Build ${Object.keys(state.builds).length + 1}`;
-  state.builds[id] = {id, name: n, envelopes: [], created: Date.now()};
+  state.builds[id] = {id, name: n, envelopes: [],
+                      targetId: state.target?.active || null, created: Date.now()};
   state.activeBuildId = id;
   saveBuilds();
   return id;
@@ -2322,20 +2400,42 @@ function renderAddButton(r) {
 
 function renderBuildPicker() {
   const el = document.getElementById("buildPicker");
+  if (!el) return;
   const builds = Object.values(state.builds);
-  if (!builds.length) {
-    el.innerHTML = `<button onclick="promptNewBuild()">+ New build</button>`;
-    return;
-  }
-  const options = builds.map(b => `<option value="${b.id}" ${b.id === state.activeBuildId ? "selected" : ""}>${escapeHtml(b.name)} (${b.envelopes.length})</option>`).join("");
+  const options = builds.map(b => `<option value="${b.id}" ${b.id === state.activeBuildId ? "selected" : ""}>`
+                                + `${escapeHtml(b.name)} (${b.envelopes.length})</option>`).join("");
   el.innerHTML = `
-    <span>Build:</span>
-    <select id="buildSelect">${options}</select>
-    <span class="badge" title="Envelopes in active build">${state.builds[state.activeBuildId]?.envelopes.length ?? 0}</span>
-    <button onclick="viewActiveBuild()" title="View build details">view</button>
-    <button onclick="promptNewBuild()" title="Create a new build">+</button>
+    <span>Amp:</span>
+    ${builds.length ? `<select id="buildSelect">${options}</select>
+      <span class="badge" title="Envelopes in this amp's build">${state.builds[state.activeBuildId]?.envelopes.length ?? 0}</span>
+      <button onclick="viewActiveBuild()" title="View this amp's build & shopping list">view</button>` : ""}
+    <button onclick="promptNewBuild()" title="Start a new amp/build">+</button>
+    <button onclick="importTargetDialog()" title="Import an amp designed in Filament Studio">import…</button>
   `;
-  document.getElementById("buildSelect").addEventListener("change", e => setActiveBuild(e.target.value));
+  const sel = document.getElementById("buildSelect");
+  if (sel) sel.addEventListener("change", async e => {
+    setActiveBuild(e.target.value);
+    await ensureBuildTarget();
+  });
+}
+
+// An amp IS a build: each build carries the target it's scored against, and
+// activating the build activates its target (server re-scores everything).
+async function ensureBuildTarget() {
+  const b = state.builds[state.activeBuildId];
+  if (!b || !b.targetId) return;
+  if (state.target?.active === b.targetId) return;
+  if (!(state.target?.available || []).some(a => a.id === b.targetId)) return;
+  await selectTarget(b.targetId);
+}
+
+async function changeBuildAmp(id, tid) {
+  const b = state.builds[id];
+  if (!b) return;
+  b.targetId = tid;
+  saveBuilds();
+  if (id === state.activeBuildId) await selectTarget(tid);
+  renderBuildDrawer(id);
 }
 
 function viewActiveBuild() {
@@ -2422,8 +2522,17 @@ function renderBuildDrawer(id) {
   if (unassigned.length) subBits.push(`${assigned.length} assigned · ${unassigned.length} cart-only`);
   subBits.push(total ? "CAD $"+total.toFixed(2) : "no price");
   html += `<h2>${escapeHtml(b.name)} <span class="sub">· ${subBits.join(" · ")}</span></h2>`;
+  const ampOpts = (state.target?.available || [])
+    .map(a => `<option value="${escapeHtml(a.id)}"${a.id === (b.targetId || state.target?.active) ? " selected" : ""}>${escapeHtml(a.name)}</option>`)
+    .join("");
+  html += `<div class="summary-line">Scored as: <select onchange="changeBuildAmp('${b.id}', this.value)">${ampOpts}</select></div>`;
   html += `<div class="actions">`;
-  html += `<button class="primary" onclick="pushBuildToStoreCart('${b.id}')" title="Sync this build to TubeHunter's pending cart so the store-cart bookmarklet can add them in one click">Push to store cart ↗</button>`;
+  if (window.pywebview) {
+    html += `<button class="primary" onclick="addBuildToStoreCartNative('${b.id}')" title="Opens the store in an app window and adds every line to your real cart — one click, no bookmarklet">Add to store cart</button>`;
+  } else {
+    html += `<button class="primary" onclick="pushBuildToStoreCart('${b.id}')" title="Sync this build to TubeHunter's pending cart so the store-cart bookmarklet can add them in one click">Push to store cart ↗</button>`;
+  }
+  html += `<button onclick="pushSelectionsToFilament('${b.id}')" title="Export the tagged tube choices so Filament Studio can swap them into the design and recompute the whole amp">→ Filament Studio</button>`;
   html += `<button onclick="copyBuildSummary('${b.id}')">Copy summary</button>`;
   html += `<button onclick="renameBuild('${b.id}')">Rename</button>`;
   html += `<button onclick="duplicateBuild('${b.id}')">Duplicate</button>`;
@@ -2616,6 +2725,88 @@ function buildToMarkdown(id) {
   return lines.join("\n");
 }
 
+/* Round-trip back to Filament Studio: one entry per role-tagged envelope
+   section, carrying the canonical tube name (for FS's registry lookup), the
+   original stage mapping when this target came from an FS import, and the
+   store listing + measured specs for reference. Schema: tubehunter-selection/1. */
+function buildSelections(id) {
+  const b = state.builds[id];
+  if (!b) return null;
+  const slotsById = Object.fromEntries((state.target?.slots || []).map(sl => [sl.id, sl]));
+  const sels = [];
+  for (const ed of buildEnvelopeData(id)) {
+    for (const [si, rid] of Object.entries(ed.envelope.roles || {})) {
+      const sl = slotsById[rid];
+      if (!sl) continue;
+      const t = ed.tube;
+      sels.push({
+        slot_id: rid,
+        stage_idx: sl.filament?.stage_idx ?? null,
+        designed_tube: sl.filament?.tube ?? null,
+        tube: t.matched_key || t.name,
+        section: (sectionsOf(t.elements || [])[+si] || {}).label || null,
+        store: {listing: t.name, url: "https://www.thetubestore.com" + t.url,
+                price_cad: t.price, in_stock: !!t.in_stock},
+        specs: {heater_v: t.heater_v, heater_a: t.heater_a, mu: t.mu,
+                gm_ma_v: t.gm, pd_w: t.plate_diss, socket: t.socket,
+                elements: t.elements},
+      });
+    }
+  }
+  return {
+    schema: "tubehunter-selection/1",
+    amp: {name: b.name,
+          target_id: b.targetId || state.target?.active || null,
+          filament_source: (state.target?.slots || []).some(sl => sl.filament)},
+    selections: sels,
+  };
+}
+
+async function pushSelectionsToFilament(id) {
+  const doc = buildSelections(id);
+  if (!doc) return;
+  if (!doc.selections.length) {
+    alert("No tubes are tagged to slots yet — assign roles in this drawer first. "
+        + "Only role-tagged envelopes get pushed (cart-only extras stay behind).");
+    return;
+  }
+  const json = JSON.stringify(doc, null, 2);
+  // Live path first: Filament Studio's integration API (proposed, port 8767).
+  // If it's not up yet — or not implemented yet — fall through to the file flow.
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 1500);
+    const r = await fetch("http://127.0.0.1:8767/api/selection", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: json, signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    if (r.ok) {
+      const j = await r.json().catch(() => ({}));
+      const applied = j.applied?.length ?? doc.selections.length;
+      let msg = `Pushed ${applied} selection${applied===1?"":"s"} to Filament Studio`;
+      if (j.unknown_tubes?.length) msg += ` (unknown there: ${j.unknown_tubes.join(", ")})`;
+      flashToast(msg);
+      return;
+    }
+  } catch (e) { /* FS API not up — use the file flow */ }
+  const fname = (state.builds[id].name || "amp").toLowerCase()
+                  .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") + ".tubes.json";
+  if (window.pywebview?.api?.save_json) {
+    const r = await window.pywebview.api.save_json(json, fname);
+    if (r?.ok) flashToast("Saved — import it in Filament Studio: " + r.path);
+    else if (!r?.cancelled) alert("Save failed: " + (r?.error || "unknown"));
+  } else {
+    const blob = new Blob([json], {type: "application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    flashToast("Downloaded — import it in Filament Studio");
+  }
+}
+
 async function copyBuildSummary(id) {
   const md = buildToMarkdown(id);
   try {
@@ -2647,6 +2838,46 @@ function consolidateEnvelopes(envData) {
    thetubestore's add-to-cart modal makes that flow noisy. The shopping list in
    the drawer now shows one "Open →" link per unique tube instead — user opens
    one, adds to cart, closes, moves on. */
+
+// Native app flow: resolve IDs server-side, then have Python drive an in-app
+// store window (shared persistent cookies) through the store's own addLines.
+// One click; the window then shows /cart for review + checkout.
+async function addBuildToStoreCartNative(id) {
+  const b = state.builds[id];
+  if (!b) return;
+  const envData = buildEnvelopeData(id);
+  if (!envData.length) { flashToast("No tubes in this build"); return; }
+  const rawItems = consolidateEnvelopes(envData).map(it => ({
+    url: it.url, qty: it.qty, name: it.tube.name, internalid: it.tube.internalid,
+  }));
+  flashToast("Resolving store IDs…");
+  let resolved;
+  try {
+    const r = await fetch("/api/pending-cart", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({build_name: b.name, items: rawItems, return_items: true}),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    resolved = await r.json();
+  } catch (e) { alert("Couldn't resolve store IDs: " + e.message); return; }
+  const items = (resolved.resolved_items || []).map(it => ({internalid: it.internalid, qty: it.qty}));
+  if (!items.length) { alert("No tubes could be resolved — are they still listed on the store?"); return; }
+  flashToast("Adding to your store cart…");
+  try {
+    const r = await fetch("/api/store-cart/add", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({items}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      let msg = `Added ${j.added} tube${j.added===1?"":"s"} — review in the store window`;
+      if (resolved.missing?.length) msg += ` (skipped: ${resolved.missing.map(m => m.name || m.url).join(", ")})`;
+      flashToast(msg);
+    } else {
+      alert("Store cart failed: " + (j.error || "unknown") + "\n\nFalling back to the bookmarklet flow is always available via a browser.");
+    }
+  } catch (e) { alert("Store cart failed: " + e.message); }
+}
 
 async function pushBuildToStoreCart(id) {
   const b = state.builds[id];
@@ -2791,6 +3022,13 @@ boot();
 """
 
 CART_BOOKMARKLET_ORIGIN = "https://www.thetubestore.com"
+# Origins allowed to call the JSON API cross-origin: the store (bookmarklet) and
+# Filament Studio's local servers (live integration — design push / selection pull).
+CORS_ALLOWED_ORIGINS = {
+    CART_BOOKMARKLET_ORIGIN,
+    "http://127.0.0.1:8766", "http://localhost:8766",   # FS dev server
+    "http://127.0.0.1:8767", "http://localhost:8767",   # FS integration API (proposed)
+}
 
 # ---------------------------------------------------------------------------
 # BOOKMARKLET — click while on any thetubestore.com page to sync the pending
@@ -2890,6 +3128,100 @@ BOOKMARKLET_JS = r"""
   }
 })();
 """
+
+# JS injected into the in-app store window. Same LiveOrder call the bookmarklet
+# makes, but items are inlined and completion is reported through a window-scoped
+# flag that Python polls — no clipboard, no user gesture needed.
+STORE_CART_JS = r"""
+(function () {
+  window.__TH_CART = 'pending';
+  var items = __ITEMS__;
+  function go(n) {
+    try {
+      var req = window.require || (window.SCM ? function (m) { return window.SCM[m]; } : null);
+      if (!req) throw new Error('nomod');
+      var Cart = req('LiveOrder.Model'), Line = req('LiveOrder.Line.Model');
+      var cart = Cart.getInstance();
+      var lines = items.map(function (it) {
+        return new Line({ item: { internalid: String(it.internalid) }, quantity: it.qty });
+      });
+      cart.addLines(lines).done(function () {
+        window.__TH_CART = 'ok';
+        setTimeout(function () { window.location.href = '/cart'; }, 400);
+      }).fail(function (e) {
+        var m = 'add failed';
+        try { m = JSON.parse(e.responseText).errorMessage || m; } catch (_) {}
+        window.__TH_CART = 'error: ' + m;
+      });
+    } catch (e) {
+      if (n < 30) setTimeout(function () { go(n + 1); }, 500);
+      else window.__TH_CART = 'error: store modules never appeared';
+    }
+  }
+  go(0);
+})();
+"""
+
+def store_cart_add(items, dry_run=False):
+    """Drive the in-app store window (native mode only): open thetubestore.com in
+    a second webview window — it shares the app's persistent cookie jar, so the
+    user's cart/session survives restarts — wait for the SuiteCommerce module
+    registry, then run the store's own addLines with the given items.
+
+    This is what "Add to store cart" does in the app; the clipboard bookmarklet
+    remains as the plain-browser fallback."""
+    try:
+        import webview
+    except ImportError:
+        return {"ok": False, "error": "native window mode isn't active — use the bookmarklet flow"}
+    if not webview.windows:
+        return {"ok": False, "error": "app window not running"}
+
+    store = next((w for w in webview.windows
+                  if getattr(w, "_tubehunter_store", False)), None)
+    if store is None:
+        store = webview.create_window(
+            "thetubestore · TubeHunter cart",
+            "https://www.thetubestore.com/",
+            width=1240, height=860)
+        store._tubehunter_store = True
+
+    deadline = time.time() + 30
+    ready = False
+    while time.time() < deadline:
+        try:
+            if store.evaluate_js("!!(window.require || window.SCM)"):
+                ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    if not ready:
+        return {"ok": False, "error": "store page didn't finish loading — try again in a moment"}
+    if dry_run:
+        return {"ok": True, "dry_run": True, "modules_ready": True}
+
+    payload = json.dumps([{"internalid": int(it["internalid"]),
+                           "qty": int(it.get("qty") or 1)} for it in items])
+    try:
+        store.evaluate_js(STORE_CART_JS.replace("__ITEMS__", payload))
+    except Exception as exc:
+        return {"ok": False, "error": f"couldn't run the cart script: {exc}"}
+
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        try:
+            res = store.evaluate_js("window.__TH_CART || ''")
+        except Exception:
+            res = ""
+        if res and res != "pending":
+            if res == "ok":
+                total = sum(int(it.get("qty") or 1) for it in items)
+                return {"ok": True, "added": total, "lines": len(items)}
+            return {"ok": False, "error": res.removeprefix("error: ")}
+        time.sleep(0.5)
+    return {"ok": False, "error": "timed out waiting for the cart — check the store window"}
+
 
 def _minify_bookmarklet(js: str) -> str:
     """Squash the readable JS into a single line for the javascript: URL.
@@ -3073,8 +3405,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         if cors:
-            # Only permit the tubestore origin; the bookmarklet runs there.
-            self.send_header("Access-Control-Allow-Origin", CART_BOOKMARKLET_ORIGIN)
+            origin = self.headers.get("Origin", "")
+            if origin in CORS_ALLOWED_ORIGINS:
+                self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
@@ -3082,8 +3415,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _cors_preflight(self):
         origin = self.headers.get("Origin", "")
         self.send_response(204)
-        if origin == CART_BOOKMARKLET_ORIGIN:
-            self.send_header("Access-Control-Allow-Origin", CART_BOOKMARKLET_ORIGIN)
+        if origin in CORS_ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Vary", "Origin")
@@ -3114,7 +3447,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
             return
         if self.path == "/api/targets":
-            self._send_json(app.target_summary())
+            self._send_json(app.target_summary(), cors=True)
             return
         if self.path == "/api/pending-cart":
             with app.pending_cart_lock:
@@ -3232,7 +3565,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
-            self._send_json({"ok": True, "imported": tid, **app.target_summary()})
+            self._send_json({"ok": True, "imported": tid, **app.target_summary()}, cors=True)
+            return
+
+        if self.path == "/api/store-cart/add":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            try:
+                payload = json.loads((self.rfile.read(length) if length else b"").decode("utf-8") or "{}")
+            except Exception:
+                self._send_json({"error": "invalid JSON"}, status=400)
+                return
+            items = payload.get("items") or []
+            dry = bool(payload.get("dry_run"))
+            if not items and not dry:
+                self._send_json({"error": "no items"}, status=400)
+                return
+            result = store_cart_add(items, dry_run=dry)
+            self._send_json(result, status=200 if result.get("ok") else 502)
             return
 
         if self.path == "/api/pending-cart":
@@ -3348,6 +3697,9 @@ class TubeHunterApp:
                     # which envelope sections can fill this slot — drives the
                     # per-section role dropdowns in the build drawer
                     "accepts_elements": spec.get("requires_element", []),
+                    # stage mapping kept from a Filament Studio import — lets the
+                    # frontend export selections FS can apply back onto the design
+                    "filament": spec.get("_filament"),
                 }
                 for sid, spec in t.get("slots", {}).items()
             ],
@@ -3540,6 +3892,27 @@ def main():
                 except Exception as exc:
                     return {"ok": False, "error": str(exc)}
 
+            def save_json(self, text, default_filename):
+                """Native Save… panel for JSON exports (e.g. pushing tube
+                selections back to Filament Studio)."""
+                win = webview.windows[0]
+                path = win.create_file_dialog(
+                    webview.SAVE_DIALOG,
+                    directory=str(Path.home() / "Downloads"),
+                    save_filename=default_filename or "export.json",
+                    file_types=("JSON Files (*.json)", "All files (*.*)"),
+                )
+                if not path:
+                    return {"ok": False, "cancelled": True}
+                if isinstance(path, (list, tuple)):
+                    path = path[0]
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    return {"ok": True, "path": path}
+                except Exception as exc:
+                    return {"ok": False, "error": str(exc)}
+
             def open_json(self):
                 """Native Open… panel for importing an amp target (e.g. a
                 Filament Studio chain export). Returns the file's text."""
@@ -3563,6 +3936,7 @@ def main():
             f"TubeHunter · {app.targets.active.get('name', '')}",
             url,
             width=1440, height=900,
+            min_size=(940, 620),
             resizable=True,
             confirm_close=False,
             js_api=WebviewApi(),
