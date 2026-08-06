@@ -13,3 +13,7 @@ data/openssl.tmp.cnf
 
 # macOS metadata for the .app bundle
 TubeHunter.app/Contents/_CodeSignature/
+
+# arm64 project venv — recreate with: /opt/homebrew/bin/python3 -m venv .venv && .venv/bin/pip install pywebview
+.venv/
+data/settings.json

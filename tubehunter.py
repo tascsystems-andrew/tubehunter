@@ -2,9 +2,9 @@
 """
 TubeHunter — scan thetubestore.com's "by leading number" catalog (CAD prices via
 the site's own /api/items JSON endpoint), classify each tube against a local
-reference (data/catalog.json), score it for the Voxy amp's six tube slots
+reference (data/catalog.json), score it against a selectable amp *target*
 (V1 pentode pre, V2 triode boost, V2 SE power, full combo drop-in, PI cathodyne,
-V2 PP mate — the last two are optional) per data/voxy.json, and serve an
+loaded from data/targets/*.json, and serve an
 iTunes-style table at http://localhost:8765/ .
 
 Run:  python3 tubehunter.py
@@ -12,7 +12,7 @@ Run:  python3 tubehunter.py
 The UI has a "Refresh from web" button. Refreshes are rate-limited to
 MAX_REFRESHES_PER_DAY per 24 h window (tracked in data/snapshot.json).
 
-Voxy has a per-rail buck-boost heater supply (any voltage up to 37 V, up to 3
+A target declares its own heater supply (max voltage, how many distinct
 distinct rails per amp), so heater compatibility is soft: any tube whose heater
 voltage is ≤37 V passes; the ranker gives a small bonus for sharing an existing
 rail (6.3 V for EF94, 13 V for PCL86) rather than adding a third.
@@ -41,13 +41,14 @@ HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
 SNAPSHOT_PATH = DATA / "snapshot.json"
 CATALOG_PATH = DATA / "catalog.json"
-VOXY_PATH = DATA / "voxy.json"
+TARGETS_DIR = DATA / "targets"
+SETTINGS_PATH = DATA / "settings.json"
 
 BASE_URL = "https://www.thetubestore.com"
 ROOT_PATH = "/other-tubes/by-leading-number"
 
 PORT = 8765
-USER_AGENT = "TubeHunter/1.0 (personal utility for Voxy amp build; contact tascai@icloud.com)"
+USER_AGENT = "TubeHunter/1.0 (personal tube-amp parts utility; contact tascai@icloud.com)"
 REQUEST_DELAY_S = 1.5
 REQUEST_TIMEOUT_S = 20
 MAX_REFRESHES_PER_DAY = 3
@@ -130,270 +131,395 @@ class Catalog:
                         return self.by_canon[k]
         return None, None
 
-# ---------- Voxy ranker ----------
+# ---------- target ranker ----------
 
-class VoxyRanker:
-    def __init__(self, path: Path):
-        self.raw = json.loads(path.read_text())
-        self.slots = self.raw["slots"]
-        heater = self.raw["amp"]["heater_supply"]
-        self.heater_v_max = heater["v_max"]
-        self.existing_rails = set(heater["existing_rails_v"])
+class TargetRanker:
+    """Scores a catalog record against an amp *target* — a declarative description
+    of the amp's chassis, heater supply, and tube slots.
 
-    def score_all(self, rec):
-        """Return {slot_id: {"score": 0..5, "reasons": [str, ...]}} for a catalog record."""
-        out = {}
-        for slot_id, spec in self.slots.items():
-            method = getattr(self, f"_score_{slot_id}", None)
-            if method:
-                out[slot_id] = method(rec, spec)
-            else:
-                out[slot_id] = {"score": 0, "reasons": ["no scorer"]}
-        return out
+    There is no per-slot Python any more: every slot is scored by the same engine
+    reading the slot's own declaration. That's what lets a target be authored by
+    hand, shipped as a preset, or generated from a Filament Studio export without
+    touching this file.
 
-    @staticmethod
-    def _cap(score):
-        return max(0.0, min(5.0, score))
+    Slot declaration fields (all optional except `accepts`):
+      accepts          {category: base_score}   which tube categories can fill this
+      requires_element [element, ...]           envelope must contain one of these
+      socket           {preferred:[..], pref_score, acceptable:{sock: score}}
+      cutoff           {prefer, bonus, penalty_remote}
+      mu_bands         [[lo, hi, score, label], ...]  graded µ fit
+      gm_min           float                    minimum transconductance
+      pd_range         [lo, hi]                 plate-dissipation window
+      va_min           float                    minimum plate-voltage rating
+      prefer_hv        float                    extra credit for exact heater match
+    """
+
+    MAX_SCORE = 5.0
+
+    def __init__(self, target: dict):
+        self.target = target
+        self.name = target.get("name", "Amp")
+        self.slots = target.get("slots", {})
+        chassis = target.get("chassis") or {}
+        self.ok_sockets = set(chassis.get("sockets") or [])
+        heater = target.get("heater_supply") or {}
+        self.heater_v_max = heater.get("v_max")
+        self.max_rails = heater.get("max_distinct_rails")
+        self.existing_rails = set(heater.get("existing_rails_v") or [])
+
+    # ---- helpers -------------------------------------------------------
+
+    @classmethod
+    def _cap(cls, score):
+        return max(0.0, min(cls.MAX_SCORE, score))
+
+    def fits_chassis(self, socket_):
+        """True/False if we know the socket, None if unclassified."""
+        if socket_ is None:
+            return None
+        if not self.ok_sockets:      # target declares no restriction
+            return True
+        return socket_ in self.ok_sockets
 
     def _heater_check(self, rec):
-        """Return (bonus, reason, hard_fail). hard_fail=True means slot score should be 0."""
+        """(bonus, reason, hard_fail)."""
         hv = rec.get("hv")
         if hv is None:
             return 0.0, "heater voltage unknown", False
-        if hv > self.heater_v_max:
-            return 0.0, f"{hv} V heater exceeds buck-boost max ({self.heater_v_max} V)", True
+        if self.heater_v_max is not None and hv > self.heater_v_max:
+            return 0.0, f"{hv} V heater exceeds supply max ({self.heater_v_max} V)", True
         if hv in self.existing_rails:
-            return 0.5, f"{hv} V heater — shares existing rail", False
-        return 0.15, f"{hv} V heater — needs a dedicated rail (≤{self.heater_v_max} V, within amp's 3-rail budget)", False
+            return 0.5, f"{hv} V heater — shares an existing rail", False
+        budget = f", within the {self.max_rails}-rail budget" if self.max_rails else ""
+        cap = f"≤{self.heater_v_max} V" if self.heater_v_max is not None else "any voltage"
+        return 0.15, f"{hv} V heater — needs a dedicated rail ({cap}{budget})", False
 
-    def _vibe_bonus(self, rec):
-        v = rec.get("vibe", 0)
-        if v >= 3:
-            return 0.7, "vibe: holy grail"
-        if v == 2:
-            return 0.4, "vibe: classic"
-        if v == 1:
-            return 0.2, "vibe: known guitar tube"
+    @staticmethod
+    def _vibe_bonus(rec):
+        v = rec.get("vibe", 0) or 0
+        if v >= 3: return 0.7, "vibe: holy grail"
+        if v == 2: return 0.4, "vibe: classic"
+        if v == 1: return 0.2, "vibe: known type"
         return 0.0, None
 
-    def _score_V1(self, rec, spec):
-        reasons = []
-        s = 0.0
-        if rec.get("cat") != "pentode_pre":
-            return {"score": 0, "reasons": ["not a small-signal pentode"]}
-        s += 2.0
-        reasons.append("small-signal pentode ✓")
-        sock = rec.get("socket")
-        if sock == spec["socket"]:
-            s += 1.0
-            reasons.append("B7G socket — drop-in ✓")
-        elif sock == "noval":
-            s += 0.4
-            reasons.append("noval socket — needs rewire (EF86 path)")
-        else:
-            reasons.append(f"{sock} socket — mechanically won't fit")
-            return {"score": self._cap(s * 0.4), "reasons": reasons}
-        h_bonus, h_reason, h_fail = self._heater_check(rec)
-        if h_fail:
-            return {"score": 0, "reasons": reasons + [h_reason]}
-        s += h_bonus
-        reasons.append(h_reason)
-        cutoff = rec.get("cutoff")
-        if cutoff == "sharp":
-            s += 0.7
-            reasons.append("sharp-cutoff ✓")
-        elif cutoff == "remote":
-            s -= 1.0
-            reasons.append("remote-cutoff — distorts audio")
-        vb, vr = self._vibe_bonus(rec)
-        s += vb
-        if vr: reasons.append(vr)
-        return {"score": round(self._cap(s), 1), "reasons": reasons}
+    # ---- the one scorer ------------------------------------------------
 
-    def _score_V2t(self, rec, spec):
-        reasons = []
-        s = 0.0
-        if rec.get("cat") not in ("triode_pre", "combo"):
-            return {"score": 0, "reasons": ["not a triode preamp"]}
-        if rec.get("cat") == "combo":
-            s += 1.2
-            reasons.append("combo tube — triode section usable, but pick 'combo' or 'V2p' instead")
-        else:
-            s += 2.0
-            reasons.append("triode preamp ✓")
-        sock = rec.get("socket")
-        if sock == spec["socket"]:
-            s += 1.0
-            reasons.append("noval socket — drop-in ✓")
-        else:
-            reasons.append(f"{sock} socket — needs adapter/rewire")
-            s -= 0.5
-        h_bonus, h_reason, h_fail = self._heater_check(rec)
-        if h_fail:
-            return {"score": 0, "reasons": reasons + [h_reason]}
-        s += h_bonus
-        reasons.append(h_reason)
-        mu = rec.get("mu")
-        lo, hi = spec["mu_range"]
-        if mu and lo <= mu <= hi:
-            s += 1.0
-            reasons.append(f"µ={mu} in the boost sweet spot")
-        elif mu:
-            s += 0.3
-            reasons.append(f"µ={mu} — usable but off-target")
-        vb, vr = self._vibe_bonus(rec)
-        s += vb
-        if vr: reasons.append(vr)
-        return {"score": round(self._cap(s), 1), "reasons": reasons}
+    def score_all(self, rec):
+        return {sid: self.score_slot(rec, spec) for sid, spec in self.slots.items()}
 
-    def _score_V2p(self, rec, spec):
+    def score_slot(self, rec, spec):
         reasons = []
-        s = 0.0
         cat = rec.get("cat")
-        if cat not in ("power", "combo"):
-            return {"score": 0, "reasons": ["not an output tube"]}
-        if cat == "combo":
-            s += 1.5
-            reasons.append("combo tube — pentode section usable, but combo slot is a better match")
-        else:
-            s += 2.0
-            reasons.append("power pentode/beam ✓")
-        sock = rec.get("socket")
-        if sock == spec["socket"]:
-            s += 1.0
-            reasons.append("noval socket — drop-in ✓")
-        elif sock == "octal":
-            s += 0.2
-            reasons.append("octal — different socket, but electrically fine (e.g. 6V6)")
-        else:
-            reasons.append(f"{sock} socket — impractical for 9-pin layout")
-            s -= 0.5
-        h_bonus, h_reason, h_fail = self._heater_check(rec)
-        if h_fail:
-            return {"score": 0, "reasons": reasons + [h_reason]}
-        s += h_bonus
-        reasons.append(h_reason)
-        va = rec.get("va_max") or 0
-        va_lo, va_hi = spec["va_range"]
-        if va >= va_lo:
-            s += 0.5
-            reasons.append(f"{va} V rating headroom vs 305 V B+")
-        else:
-            reasons.append(f"only {va} V rated — too fragile at 305 V")
-            s -= 1.0
-        pd = rec.get("pd") or 0
-        pd_lo, pd_hi = spec["pd_range"]
-        if pd_lo <= pd <= pd_hi:
-            s += 1.0
-            reasons.append(f"{pd} W diss — matches SE 4 W target")
-        elif pd > pd_hi:
-            s += 0.2
-            reasons.append(f"{pd} W diss — overkill for 4 W SE, wastes heater budget")
-        else:
-            reasons.append(f"{pd} W diss — too small for 4 W SE")
-        vb, vr = self._vibe_bonus(rec)
-        s += vb
-        if vr: reasons.append(vr)
-        return {"score": round(self._cap(s), 1), "reasons": reasons}
 
-    def _score_combo(self, rec, spec):
-        reasons = []
-        s = 0.0
-        if rec.get("cat") != "combo":
-            return {"score": 0, "reasons": ["not a triode-pentode combo"]}
-        s += 2.0
-        reasons.append("triode-pentode combo ✓")
-        pd = rec.get("pd") or 0
-        pd_lo, pd_hi = spec["pd_range"]
-        if pd_lo <= pd <= pd_hi:
-            s += 0.8
-            reasons.append(f"pentode diss {pd} W within SE range")
-        else:
-            s -= 0.3
-            reasons.append(f"pentode diss {pd} W outside SE-power window")
-        sock = rec.get("socket")
-        if sock == spec["socket"]:
-            s += 1.0
-            reasons.append("noval socket — drop-in ✓")
-        else:
-            reasons.append(f"{sock} socket — impractical")
-            s -= 0.5
-        h_bonus, h_reason, h_fail = self._heater_check(rec)
-        if h_fail:
-            return {"score": 0, "reasons": reasons + [h_reason]}
-        s += h_bonus + (0.5 if rec.get("hv") == 13.0 else 0)
-        reasons.append(h_reason + (" · matches PCL86 rail exactly" if rec.get("hv") == 13.0 else ""))
-        mu = rec.get("mu")
-        lo, hi = spec["mu_range"]
-        if mu and lo <= mu <= hi:
-            s += 0.5
-            reasons.append(f"triode µ={mu} in range")
-        vb, vr = self._vibe_bonus(rec)
-        s += vb
-        if vr: reasons.append(vr)
-        return {"score": round(self._cap(s), 1), "reasons": reasons}
+        # 1. category gate
+        accepts = spec.get("accepts") or {}
+        if cat not in accepts:
+            return {"score": 0, "reasons": [f"{cat or 'unclassified'} doesn't fill this slot"]}
+        s = float(accepts[cat])
+        primary = s >= max(accepts.values())
+        reasons.append(f"{cat} ✓" if primary
+                       else f"{cat} — usable here, but another slot suits it better")
 
-    def _score_PI(self, rec, spec):
-        reasons = []
-        s = 0.0
-        cat = rec.get("cat")
-        if cat not in ("triode_pre", "combo"):
-            return {"score": 0, "reasons": ["not a triode — cathodyne needs one triode section"]}
-        if cat == "combo":
-            s += 1.2
-            reasons.append("combo tube — triode section usable as cathodyne, but you'd waste the pentode")
-        else:
-            s += 2.0
-            reasons.append("triode ✓ — one section serves as cathodyne split-load")
+        # 2. envelope must actually contain the needed section
+        need = spec.get("requires_element")
+        if need:
+            have = rec.get("elements") or []
+            if have and not any(e in have for e in need):
+                return {"score": 0,
+                        "reasons": reasons + [f"envelope has no {' or '.join(need)} section"]}
+
+        # 3. socket / chassis
         sock = rec.get("socket")
-        if sock in ("noval", "octal"):
-            s += 1.0
-            reasons.append(f"{sock} socket — fits standard PI layouts")
-        else:
-            reasons.append(f"{sock} socket — impractical here")
+        sockspec = spec.get("socket") or {}
+        preferred = sockspec.get("preferred") or []
+        acceptable = sockspec.get("acceptable") or {}
+        if self.ok_sockets and sock is not None and sock not in self.ok_sockets:
+            return {"score": 0,
+                    "reasons": reasons + [f"{sock} socket — doesn't fit the {self.name} chassis "
+                                          f"({', '.join(sorted(self.ok_sockets))} only)"]}
+        if sock in preferred:
+            s += float(sockspec.get("pref_score", 1.0))
+            reasons.append(f"{sock} socket — drop-in ✓")
+        elif sock in acceptable:
+            s += float(acceptable[sock])
+            reasons.append(f"{sock} socket — workable, needs rewiring")
+        elif preferred or acceptable:
             s -= 0.5
-        h_bonus, h_reason, h_fail = self._heater_check(rec)
-        if h_fail:
-            return {"score": 0, "reasons": reasons + [h_reason]}
-        s += h_bonus
-        reasons.append(h_reason)
+            reasons.append(f"{sock or '?'} socket — awkward for this slot")
+
+        # 4. heater
+        bonus, reason, fail = self._heater_check(rec)
+        if fail:
+            return {"score": 0, "reasons": reasons + [reason]}
+        s += bonus
+        if spec.get("prefer_hv") is not None and rec.get("hv") == spec["prefer_hv"]:
+            s += 0.5
+            reason += " · exact match for this slot's rail"
+        reasons.append(reason)
+
+        # 5. cutoff character (pentodes)
+        cutspec = spec.get("cutoff")
+        if cutspec:
+            c = rec.get("cutoff")
+            if c and c == cutspec.get("prefer"):
+                s += float(cutspec.get("bonus", 0.5))
+                reasons.append(f"{c}-cutoff ✓")
+            elif c == "remote":
+                s += float(cutspec.get("penalty_remote", -1.0))
+                reasons.append("remote-cutoff — distorts audio")
+
+        # 6. µ fit, graded
+        bands = spec.get("mu_bands")
         mu = rec.get("mu")
-        if mu:
-            if 15 <= mu <= 30:
-                s += 1.2
-                reasons.append(f"µ={mu} — ideal cathodyne (clean, linear split)")
-            elif 31 <= mu <= 60:
-                s += 0.9
-                reasons.append(f"µ={mu} — solid cathodyne (12AY7/5751 territory)")
-            elif 61 <= mu <= 90:
-                s += 0.7
-                reasons.append(f"µ={mu} — usable (12AT7-class)")
-            elif mu > 90:
-                s += 0.5
-                reasons.append(f"µ={mu} — high gain, works (Fender-style 12AX7 PI) but lower headroom")
+        if bands and mu is not None:
+            for lo, hi, sc, label in bands:
+                if lo <= mu <= hi:
+                    s += float(sc)
+                    reasons.append(f"µ={mu} — {label}")
+                    break
             else:
+                s += 0.2
+                reasons.append(f"µ={mu} — outside the ideal window")
+
+        # 7. transconductance floor
+        if spec.get("gm_min") is not None and rec.get("gm") is not None:
+            if rec["gm"] >= spec["gm_min"]:
                 s += 0.3
-                reasons.append(f"µ={mu} — very low, may need extra gain upstream")
+                reasons.append(f"gm={rec['gm']} mA/V — enough gain")
+            else:
+                reasons.append(f"gm={rec['gm']} mA/V — low for this slot")
+
+        # 8. plate-voltage rating
+        if spec.get("va_min") is not None:
+            va = rec.get("va_max") or 0
+            if va >= spec["va_min"]:
+                s += 0.5
+                reasons.append(f"{va} V rating clears the {spec['va_min']} V rail")
+            else:
+                s -= 1.0
+                reasons.append(f"only {va} V rated — too fragile for this rail")
+
+        # 9. plate dissipation window
+        rng = spec.get("pd_range")
+        if rng:
+            pd = rec.get("pd") or 0
+            lo, hi = rng
+            if lo <= pd <= hi:
+                s += 1.0
+                reasons.append(f"{pd} W dissipation — matches the target output")
+            elif pd > hi:
+                s += float(spec.get("pd_over_score", 0.2))
+                reasons.append(f"{pd} W dissipation — more than needed, wastes heater budget")
+            else:
+                reasons.append(f"{pd} W dissipation — too small for the target output")
+
+        # 10. heritage
         vb, vr = self._vibe_bonus(rec)
         s += vb
         if vr: reasons.append(vr)
+
         return {"score": round(self._cap(s), 1), "reasons": reasons}
 
-    def _score_V2p_B(self, rec, spec):
-        # Second half of a push-pull output pair. Scoring rubric is identical to V2p
-        # (must be same tube type), but the reasoning refers to PP context, and matched-
-        # pair availability (in_stock) matters more.
-        base = self._score_V2p(rec, spec)
-        # rewrite the top-of-reasons line
-        reasons = base["reasons"][:]
-        for i, r in enumerate(reasons):
-            if r == "power pentode/beam ✓":
-                reasons[i] = "power pentode/beam ✓ — usable as PP mate (buy a matched pair)"
-                break
-            if r.startswith("combo tube — pentode section usable"):
-                reasons[i] = "combo tube — pentode-section PP is unusual; V2p rubric applies but sockets get busy"
-                break
-        return {"score": base["score"], "reasons": reasons}
+
+def target_from_filament_studio(doc: dict) -> dict:
+    """Convert a Filament Studio chain export (schemaVersion 1) into a TubeHunter
+    target.
+
+    Filament Studio already ships everything needed — no changes required on that
+    side. Per tube stage it gives us the tube's type/subType, heater voltage and
+    current, the solved Q-point, the small-signal gain, and the model's pDiss /
+    vpMax limits. We turn each tube stage into a slot whose requirements bracket
+    what the designed stage actually does, so TubeHunter can find alternates that
+    would drop into the same socket and operating point.
+    """
+    stages = doc.get("stages") or []
+    amp = doc.get("amp") or {}
+    name = amp.get("name") or "Imported amp"
+
+    TUBE_STAGES = {"triode", "pentode"}
+    tube_stages = [s for s in stages if s.get("type") in TUBE_STAGES and s.get("tube")]
+    if not tube_stages:
+        raise ValueError("no tube stages found — is this a Filament Studio chain export?")
+
+    # Heater rails actually used by the design.
+    rails = []
+    for s in tube_stages:
+        hv = ((s.get("tube") or {}).get("heater") or {}).get("Vset")
+        if hv is not None and hv not in rails:
+            rails.append(float(hv))
+
+    # Sockets: infer from pin count where Filament Studio records it, otherwise
+    # allow the common small-signal bases plus octal (import is deliberately
+    # permissive — the user can tighten it by editing the target file).
+    sockets = ["B7G", "noval", "octal"]
+
+    slots = {}
+    for s in tube_stages:
+        tube = s.get("tube") or {}
+        model = tube.get("model") or {}
+        q = s.get("qPoint") or {}
+        ss = s.get("smallSignal") or {}
+        is_pentode = (tube.get("type") == "pentode")
+        pdiss = model.get("pDiss")
+        vpmax = model.get("vpMax")
+        mu = model.get("mu")
+        qp_diss = q.get("Pdiss_W") or 0
+
+        # A stage dissipating more than ~2 W is doing power work; below that it's
+        # small-signal. That split decides which catalog categories can fill it.
+        is_power = bool(pdiss and pdiss >= 6 and qp_diss >= 1.5)
+
+        if is_power:
+            accepts = {"power": 2.0, "combo": 1.5}
+            elements = ["power_pentode", "beam_power", "power_triode"]
+            pd_range = [max(1.0, round(pdiss * 0.6, 1)), round(pdiss * 1.6, 1)] if pdiss else None
+        elif is_pentode:
+            accepts = {"pentode_pre": 2.0}
+            elements = ["pentode"]
+            pd_range = None
+        else:
+            accepts = {"triode_pre": 2.0, "combo": 1.2}
+            elements = ["triode"]
+            pd_range = None
+
+        spec = {
+            "label": f"{s.get('name') or s.get('blockDisplay') or 'Stage'} · {tube.get('name','?')}",
+            "role": f"Imported from Filament Studio — designed around {tube.get('name','?')}"
+                    + (f", gain {ss.get('Av')}×" if ss.get("Av") else "")
+                    + (f", Q-point {q.get('Vp')} V / {q.get('Ip_mA')} mA" if q.get("Vp") else ""),
+            "accepts": accepts,
+            "requires_element": elements,
+            "socket": {"preferred": ["noval", "B7G"], "pref_score": 1.0,
+                       "acceptable": {"octal": 0.6}},
+            "notes": (f"Filament Studio stage {s.get('idx')} ({s.get('type')}). "
+                      f"Heater {((tube.get('heater') or {}).get('Vset'))} V. "
+                      f"Original tube {tube.get('name','?')}"
+                      + (f", µ={mu}" if mu else "")
+                      + (f", pDiss {pdiss} W" if pdiss else "")
+                      + "."),
+            "_filament": {
+                "stage_idx": s.get("idx"),
+                "tube": tube.get("name"),
+                "topology": s.get("topology"),
+                "qPoint": q,
+                "smallSignal": ss,
+                "heater": tube.get("heater"),
+            },
+        }
+        if pd_range:
+            spec["pd_range"] = pd_range
+            spec["pd_over_score"] = 0.3
+        if vpmax:
+            # Require the replacement to at least tolerate the rail this stage runs on.
+            b_plus = (s.get("rails") or {}).get("bPlus_V")
+            if b_plus:
+                spec["va_min"] = int(b_plus)
+        if mu and not is_power:
+            lo, hi = max(1, int(mu * 0.5)), int(mu * 2)
+            spec["mu_bands"] = [
+                [max(1, int(mu * 0.8)), int(mu * 1.25), 1.0, f"close to the designed µ={mu}"],
+                [lo, hi, 0.5, f"in range of the designed µ={mu}"],
+            ]
+        hv = ((tube.get("heater") or {}).get("Vset"))
+        if hv is not None:
+            spec["prefer_hv"] = float(hv)
+
+        # Slot IDs must be unique and stable.
+        base = re.sub(r"[^A-Za-z0-9]+", "_", (s.get("name") or f"stage{s.get('idx')}")).strip("_")
+        sid = base or f"stage{s.get('idx')}"
+        n = 2
+        while sid in slots:
+            sid = f"{base}_{n}"; n += 1
+        slots[sid] = spec
+
+    b_plus = None
+    for s in tube_stages:
+        b_plus = (s.get("rails") or {}).get("bPlus_V") or b_plus
+
+    return {
+        "schema": "tubehunter-target/1",
+        "id": re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "imported",
+        "name": name,
+        "description": (amp.get("description") or "").strip()
+                       or f"Imported from Filament Studio — {len(tube_stages)} tube stage(s).",
+        "source": "filament-studio",
+        "chassis": {"sockets": sockets,
+                    "note": "Imported permissively. Edit this list to match your real chassis punches."},
+        "heater_supply": {
+            "type": "imported",
+            "v_max": max(rails + [6.3]) if rails else 6.3,
+            "max_distinct_rails": max(3, len(rails)),
+            "existing_rails_v": rails,
+            "note": "Rails taken from the heater voltages the Filament Studio design uses.",
+        },
+        "rails": {"b_plus_v": b_plus} if b_plus else {},
+        "slots": slots,
+    }
+
+
+class TargetLibrary:
+    """All amp targets on disk (data/targets/*.json) plus which one is active."""
+
+    def __init__(self, directory: Path, state_path: Path):
+        self.dir = directory
+        self.state_path = state_path
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.reload()
+
+    def reload(self):
+        self.targets = {}
+        for f in sorted(self.dir.glob("*.json")):
+            try:
+                t = json.loads(f.read_text())
+            except Exception as exc:
+                print(f"[targets] skipping {f.name}: {exc}", file=sys.stderr)
+                continue
+            tid = t.get("id") or f.stem
+            t["id"] = tid
+            t["_file"] = f.name
+            self.targets[tid] = t
+        self.active_id = self._load_active()
+
+    def _load_active(self):
+        chosen = None
+        if self.state_path.exists():
+            try:
+                chosen = json.loads(self.state_path.read_text()).get("active_target")
+            except Exception:
+                chosen = None
+        if chosen in self.targets:
+            return chosen
+        return next(iter(self.targets), None)
+
+    def set_active(self, tid):
+        if tid not in self.targets:
+            raise KeyError(tid)
+        self.active_id = tid
+        self.state_path.write_text(json.dumps({"active_target": tid}, indent=2))
+
+    @property
+    def active(self):
+        return self.targets.get(self.active_id) or {"name": "No target", "slots": {}}
+
+    def ranker(self):
+        return TargetRanker(self.active)
+
+    def save(self, target: dict) -> str:
+        tid = target.get("id") or re.sub(r"[^a-z0-9]+", "-", target.get("name", "target").lower()).strip("-")
+        target["id"] = tid
+        path = self.dir / f"{tid}.json"
+        payload = {k: v for k, v in target.items() if not k.startswith("_")}
+        path.write_text(json.dumps(payload, indent=2))
+        self.reload()
+        return tid
+
+    def delete(self, tid):
+        t = self.targets.get(tid)
+        if not t:
+            raise KeyError(tid)
+        (self.dir / t["_file"]).unlink(missing_ok=True)
+        self.reload()
+
 
 # ---------- scraper ----------
 
@@ -628,16 +754,18 @@ class Snapshot:
 PASSTHROUGH_FIELDS = ("name", "url", "internalid", "price", "price_formatted", "currency",
                       "in_stock", "rating", "reviews")
 
-# The Voxy chassis only accepts B7G (7-pin) or noval (9-pin) — anything octal,
+# Chassis legality depends on the active target's declared socket list.
 # UX4/5/6, loctal, magnoval etc. is bigger and won't fit. Unknown socket → also
 # doesn't fit (safer default; user can un-hide via "All sockets").
-CHASSIS_OK_SOCKETS = {"B7G", "noval"}
+# Chassis legality is a property of the active target, not a global constant —
+# see TargetRanker.fits_chassis(). This shim keeps call sites tidy.
+def fits_chassis(socket_, ranker=None):
+    if ranker is not None:
+        return ranker.fits_chassis(socket_)
+    return None
 
-def fits_chassis(socket_):
-    return socket_ in CHASSIS_OK_SOCKETS
-
-def enrich(products, catalog: Catalog, ranker: VoxyRanker):
-    """Return the same product dicts with classification + Voxy scores added."""
+def enrich(products, catalog: Catalog, ranker: "TargetRanker"):
+    """Return the same product dicts with classification + per-slot target scores added."""
     out = []
     for p in products:
         key, rec = catalog.classify(p["name"])
@@ -652,10 +780,11 @@ def enrich(products, catalog: Catalog, ranker: VoxyRanker):
         vibe = rec.get("vibe", 0) if rec else 0
         notes = rec.get("notes") if rec else None
         elements = rec.get("elements") if rec else None
-        chassis_ok = fits_chassis(socket_) if classified else None
+        chassis_ok = ranker.fits_chassis(socket_) if classified else None
         if classified and not chassis_ok:
-            # Hard chassis fail — zero every Voxy slot score with a clear reason.
-            reason = f"{socket_ or '?'} socket — doesn't fit Voxy chassis (7-pin B7G or 9-pin noval only)"
+            # Hard chassis fail — zero every slot score with a clear reason.
+            reason = (f"{socket_ or '?'} socket — doesn't fit the {ranker.name} chassis "
+                      f"({', '.join(sorted(ranker.ok_sockets)) or 'no sockets declared'} only)")
             scores = {slot: {"score": 0, "reasons": [reason]} for slot in ranker.slots}
         elif rec:
             scores = ranker.score_all(rec)
@@ -686,7 +815,7 @@ def enrich(products, catalog: Catalog, ranker: VoxyRanker):
 # ---------- background refresh ----------
 
 class RefreshRunner:
-    def __init__(self, snapshot: Snapshot, catalog: Catalog, ranker: VoxyRanker):
+    def __init__(self, snapshot: Snapshot, catalog: Catalog, ranker: "TargetRanker"):
         self.snapshot = snapshot
         self.catalog = catalog
         self.ranker = ranker
@@ -743,7 +872,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>TubeHunter — Voxy</title>
+<title>TubeHunter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
@@ -932,6 +1061,25 @@ INDEX_HTML = r"""<!doctype html>
     text-decoration: none;
   }
   .cart-setup:hover { background: #e0c8ff; text-decoration: none; }
+  .target-picker {
+    display: flex; align-items: center; gap: 5px; font-size: 11px;
+    background: #fff; border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 6px;
+  }
+  .target-picker .tp-label { color: #555; }
+  .target-picker select {
+    font: inherit; border: 0; background: transparent; outline: none;
+    max-width: 190px; font-weight: 600; color: #17376b;
+  }
+  .target-picker button {
+    font: inherit; border: 0; background: transparent; cursor: pointer;
+    color: #2a4dab; padding: 0 2px;
+  }
+  .target-picker button:hover { color: #17376b; text-decoration: underline; }
+  .target-picker .tp-chassis {
+    color: #4c1c7a; background: #f0dcff; border-radius: 8px;
+    padding: 0 6px; font-size: 10px; white-space: nowrap;
+  }
   .export-btn {
     font: inherit; font-size: 11px; padding: 3px 10px;
     border: 1px solid var(--border); border-radius: 4px;
@@ -1146,7 +1294,8 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
   <div id="frame">
-    <div class="title">TubeHunter · Voxy</div>
+    <div class="title">TubeHunter</div>
+    <div class="target-picker" id="targetPicker"></div>
     <input id="search" placeholder="Filter (e.g. EF86, noval, combo)">
     <label class="chassis-toggle"><input type="checkbox" id="chassisToggle" checked> Fits chassis</label>
     <label class="chassis-toggle"><input type="checkbox" id="stockToggle" checked> In stock only</label>
@@ -1183,7 +1332,7 @@ INDEX_HTML = r"""<!doctype html>
           <tbody id="tbody"></tbody>
         </table>
       </div>
-      <div id="detail"><div class="empty">Select a tube to see how it scores for each Voxy slot.</div></div>
+      <div id="detail"><div class="empty">Select a tube to see how it scores for each slot.</div></div>
     </div>
   </div>
   <div id="status"><span id="rowcount"></span></div>
@@ -1192,7 +1341,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 "use strict";
 
-const COLS = [
+const BASE_COLS = [
   {key: "in_build",     label: "",             w: 34,  render: r => renderAddButton(r), sortVal: r => envelopesForTube(r.url), cls: "add-cell"},
   {key: "name",         label: "Tube",         w: 210, render: r => `<a href="https://www.thetubestore.com${r.url}" target="_blank" rel="noopener">${escapeHtml(r.name)}</a>`},
   {key: "category",     label: "Type",         w: 110, render: r => `<span class="cat-pill cat-${r.category}">${prettyCat(r.category)}</span>`},
@@ -1204,14 +1353,40 @@ const COLS = [
   {key: "gm",           label: "gm",           w: 40,  render: r => r.gm ?? "—", cls: "num"},
   {key: "price",        label: "Price (CAD)",  w: 84,  render: r => renderPrice(r), sortVal: r => r.price, cls: "num"},
   {key: "in_stock",     label: "Stock",        w: 60,  render: r => r.in_stock ? "In stock" : "Out", cls: r => r.in_stock ? "" : "oos"},
-  {key: "score_V1",     label: "V1 pent",      w: 74,  render: r => stars(r.scores.V1.score), sortVal: r => r.scores.V1.score, cls: "num"},
-  {key: "score_V2t",    label: "V2 tri",       w: 74,  render: r => stars(r.scores.V2t.score), sortVal: r => r.scores.V2t.score, cls: "num"},
-  {key: "score_V2p",    label: "V2 pow",       w: 74,  render: r => stars(r.scores.V2p.score), sortVal: r => r.scores.V2p.score, cls: "num"},
-  {key: "score_combo",  label: "Combo",        w: 74,  render: r => stars(r.scores.combo.score), sortVal: r => r.scores.combo.score, cls: "num"},
-  {key: "score_PI",     label: "PI",           w: 74,  render: r => stars(r.scores.PI.score), sortVal: r => r.scores.PI.score, cls: "num"},
-  {key: "score_V2p_B",  label: "PP mate",      w: 74,  render: r => stars(r.scores.V2p_B.score), sortVal: r => r.scores.V2p_B.score, cls: "num"},
-  {key: "voxy_overall", label: "Voxy Fit",     w: 84,  render: r => stars(r.voxy_overall), cls: "num"},
 ];
+
+// Slot columns are generated from the active target rather than hardcoded, so a
+// target with three slots shows three columns and one with eight shows eight.
+function slotColumns() {
+  const slots = (state.target && state.target.slots) || [];
+  const cols = slots.map(sl => ({
+    key: "score_" + sl.id,
+    label: shortSlotLabel(sl),
+    title: sl.label + (sl.role ? " — " + sl.role : ""),
+    w: 74,
+    render: r => stars(r.scores?.[sl.id]?.score ?? 0),
+    sortVal: r => r.scores?.[sl.id]?.score ?? 0,
+    cls: "num",
+  }));
+  cols.push({
+    key: "voxy_overall",
+    label: (state.target?.name || "Amp") + " fit",
+    title: "Best score across all slots of the active target",
+    w: 92,
+    render: r => stars(r.voxy_overall),
+    cls: "num",
+  });
+  return cols;
+}
+
+// Turn "V2 pentode · SE output" into something that fits a 74px column header.
+function shortSlotLabel(sl) {
+  const raw = sl.label || sl.id;
+  const head = raw.split("·")[0].trim();
+  return head.length <= 12 ? head : head.slice(0, 11) + "…";
+}
+
+function allColumns() { return BASE_COLS.concat(slotColumns()); }
 
 const ELEMENT_LABEL = {
   triode: "triode", pentode: "pentode",
@@ -1260,12 +1435,13 @@ const state = {
   filter: {kind: "all"},
   search: "",
   meta: null,
-  chassisOnly: true,   // default: hide tubes that won't physically fit Voxy
+  target: null,        // active amp target: {name, slots:[...], available:[...]}
+  chassisOnly: true,   // default: hide tubes that don't fit the target chassis
   inStockOnly: true,   // default: hide out-of-stock listings
   priceMin: 0,
   priceMax: 0,       // set from data at boot
   priceCeil: 0,      // slider max (highest price in current snapshot, rounded up)
-  minStars: 0,       // Voxy fit floor, 0–5
+  minStars: 0,       // target-fit floor, 0–5
   // Multi-build carts (like playlists) persisted to localStorage.
   builds: {},          // {id: {id, name, envelopes: [{id, tubeUrl, roles: {sectionIdx: roleId}}], created}}
   activeBuildId: null, // "+" adds to this one
@@ -1273,6 +1449,7 @@ const state = {
 };
 
 async function boot() {
+  await loadTarget();
   await load();
   loadBuilds();
   initPriceFilter();
@@ -1299,6 +1476,107 @@ async function boot() {
   document.getElementById("exportCsv").addEventListener("click", exportInventoryCsv);
 }
 
+/* ==================== AMP TARGETS ==================== */
+
+async function loadTarget() {
+  try {
+    const r = await fetch("/api/targets");
+    state.target = await r.json();
+  } catch (e) {
+    state.target = {name: "No target", slots: [], available: []};
+  }
+  renderTargetPicker();
+  document.title = "TubeHunter · " + (state.target?.name || "");
+}
+
+function renderTargetPicker() {
+  const el = document.getElementById("targetPicker");
+  if (!el) return;
+  const t = state.target || {};
+  const opts = (t.available || [])
+    .map(a => `<option value="${escapeHtml(a.id)}"${a.id === t.active ? " selected" : ""}>`
+            + `${escapeHtml(a.name)} (${a.slot_count})</option>`)
+    .join("");
+  const chassis = (t.chassis?.sockets || []).join(", ");
+  el.innerHTML = `
+    <span class="tp-label">Amp:</span>
+    <select id="targetSelect" title="${escapeHtml(t.description || "")}">${opts}</select>
+    <button id="targetImport" title="Import an amp design exported from Filament Studio">import…</button>
+    <span class="tp-chassis" title="Sockets this chassis accepts">${escapeHtml(chassis)}</span>
+  `;
+  const sel = document.getElementById("targetSelect");
+  if (sel) sel.addEventListener("change", e => selectTarget(e.target.value));
+  const imp = document.getElementById("targetImport");
+  if (imp) imp.addEventListener("click", importTargetDialog);
+}
+
+async function selectTarget(id) {
+  flashToast("Re-scoring inventory…");
+  try {
+    const r = await fetch("/api/target/select", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({id}),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    state.target = await r.json();
+  } catch (e) { alert("Couldn't switch target: " + e.message); return; }
+  // Slot columns changed, so a sort key pointing at an old slot must be reset.
+  if (!allColumns().some(c => c.key === state.sortKey)) state.sortKey = "voxy_overall";
+  if (state.filter?.kind === "slot" &&
+      !(state.target.slots || []).some(sl => sl.id === state.filter.val)) {
+    state.filter = {kind: "all"};
+  }
+  await load();
+  document.title = "TubeHunter · " + (state.target?.name || "");
+  renderTargetPicker(); renderHead(); renderSidebar(); applyFilter(); clearDetail();
+  flashToast("Now scoring for " + state.target.name);
+}
+
+async function importTargetDialog() {
+  // Native window: let Python open a real Open… panel. Browser: file input.
+  let text = null;
+  if (window.pywebview?.api?.open_json) {
+    const res = await window.pywebview.api.open_json();
+    if (!res || res.cancelled) return;
+    if (!res.ok) { alert("Couldn't read file: " + (res.error || "unknown")); return; }
+    text = res.text;
+  } else {
+    text = await new Promise(resolve => {
+      const inp = document.createElement("input");
+      inp.type = "file"; inp.accept = ".json,application/json";
+      inp.onchange = () => {
+        const f = inp.files?.[0];
+        if (!f) return resolve(null);
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result));
+        fr.onerror = () => resolve(null);
+        fr.readAsText(f);
+      };
+      inp.click();
+    });
+    if (!text) return;
+  }
+  try {
+    const r = await fetch("/api/target/import", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({document: text}),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+    state.target = j;
+    state.sortKey = "voxy_overall";
+    state.filter = {kind: "all"};
+    await load();
+    document.title = "TubeHunter · " + (state.target?.name || "");
+    renderTargetPicker(); renderHead(); renderSidebar(); applyFilter(); clearDetail();
+    alert(`Imported "${j.name}" with ${(j.slots || []).length} slot(s).\n\n`
+        + `Inventory is now scored against it. Chassis sockets were imported permissively — `
+        + `edit data/targets/${j.active}.json to match your real chassis.`);
+  } catch (e) {
+    alert("Import failed: " + e.message);
+  }
+}
+
 // Dump every tube in the current snapshot to CSV — no filters applied.
 // In the native pywebview window, hand the text to Python via the JS API so
 // Python can pop a Save… dialog; WKWebView doesn't handle blob downloads and
@@ -1321,13 +1599,10 @@ async function exportInventoryCsv() {
     {label: "Currency",    get: r => r.currency || ""},
     {label: "In stock",    get: r => r.in_stock ? "yes" : "no"},
     {label: "Fits chassis",get: r => r.fits_chassis === true ? "yes" : r.fits_chassis === false ? "no" : "unknown"},
-    {label: "V1 score",    get: r => r.scores?.V1?.score ?? ""},
-    {label: "V2t score",   get: r => r.scores?.V2t?.score ?? ""},
-    {label: "V2p score",   get: r => r.scores?.V2p?.score ?? ""},
-    {label: "Combo score", get: r => r.scores?.combo?.score ?? ""},
-    {label: "PI score",    get: r => r.scores?.PI?.score ?? ""},
-    {label: "V2p_B score", get: r => r.scores?.V2p_B?.score ?? ""},
-    {label: "Voxy overall",get: r => r.voxy_overall ?? ""},
+    ...((state.target?.slots) || []).map(sl => (
+      {label: sl.label + " score", get: r => r.scores?.[sl.id]?.score ?? ""}
+    )),
+    {label: "Target fit",  get: r => r.voxy_overall ?? ""},
     {label: "URL",         get: r => r.url ? "https://www.thetubestore.com" + r.url : ""},
     {label: "Notes",       get: r => r.notes || ""},
   ];
@@ -1508,7 +1783,7 @@ function updateMeta() {
 function renderHead() {
   const tr = document.getElementById("thead");
   tr.innerHTML = "";
-  COLS.forEach(c => {
+  allColumns().forEach(c => {
     const th = document.createElement("th");
     th.style.width = c.w + "px";
     const arrow = state.sortKey === c.key ? (state.sortDir > 0 ? " ▲" : " ▼") : "";
@@ -1534,7 +1809,7 @@ function renderSidebar() {
   }
   if (state.minStars > 0) pool = pool.filter(r => (r.voxy_overall || 0) >= state.minStars);
   const counts = countBy(pool, r => r.category);
-  const bestForSlot = slot => pool.filter(r => r.scores[slot].score >= 4).length;
+  const bestForSlot = slot => pool.filter(r => (r.scores?.[slot]?.score ?? 0) >= 4).length;
   const groups = [
     {header: "Library"},
     {label: "All tubes", key: {kind: "all"}, count: pool.length},
@@ -1552,15 +1827,26 @@ function renderSidebar() {
     {label: "Converter (AM)", key: {kind: "cat", val: "converter"},   count: counts["converter"] || 0},
     {label: "Magic eye",      key: {kind: "cat", val: "magic_eye"},   count: counts["magic_eye"] || 0},
     {label: "Other / special",key: {kind: "cat", val: "other"},       count: counts["other"] || 0},
-    {header: "Best for Voxy"},
-    {label: "★★★★+ V1 pentode", key: {kind: "slot", val: "V1"},    count: bestForSlot("V1")},
-    {label: "★★★★+ V2 triode",  key: {kind: "slot", val: "V2t"},   count: bestForSlot("V2t")},
-    {label: "★★★★+ V2 power",   key: {kind: "slot", val: "V2p"},   count: bestForSlot("V2p")},
-    {label: "★★★★+ Combo",      key: {kind: "slot", val: "combo"}, count: bestForSlot("combo")},
-    {header: "Optional slots"},
-    {label: "★★★★+ Cathodyne PI", key: {kind: "slot", val: "PI"},    count: bestForSlot("PI")},
-    {label: "★★★★+ PP power mate", key: {kind: "slot", val: "V2p_B"}, count: bestForSlot("V2p_B")},
   ];
+  // One sidebar entry per slot of the active target; optional slots get grouped
+  // under their own header so the required build is readable at a glance.
+  const slots = (state.target && state.target.slots) || [];
+  const required = slots.filter(sl => !sl.optional);
+  const optional = slots.filter(sl => sl.optional);
+  if (required.length) {
+    groups.push({header: "Best for " + (state.target?.name || "target")});
+    for (const sl of required) {
+      groups.push({label: "★★★★+ " + shortSlotLabel(sl),
+                   key: {kind: "slot", val: sl.id}, count: bestForSlot(sl.id)});
+    }
+  }
+  if (optional.length) {
+    groups.push({header: "Optional slots"});
+    for (const sl of optional) {
+      groups.push({label: "★★★★+ " + shortSlotLabel(sl),
+                   key: {kind: "slot", val: sl.id}, count: bestForSlot(sl.id)});
+    }
+  }
   // Builds section (playlists) — one entry per saved build, plus a "+ New" action.
   groups.push({header: "Builds"});
   for (const b of Object.values(state.builds)) {
@@ -1624,7 +1910,7 @@ function applyFilter() {
   if (f.kind === "cat")        rows = rows.filter(r => r.category === f.val);
   else if (f.kind === "unknown") rows = rows.filter(r => !r.classified);
   else if (f.kind === "classified") rows = rows.filter(r => r.classified);
-  else if (f.kind === "slot") rows = rows.filter(r => r.scores[f.val].score >= 4);
+  else if (f.kind === "slot") rows = rows.filter(r => (r.scores?.[f.val]?.score ?? 0) >= 4);
   else if (f.kind === "build") {
     const b = state.builds[f.val];
     const urls = new Set(b ? b.envelopes.map(e => e.tubeUrl) : []);
@@ -1646,7 +1932,7 @@ function applyFilter() {
 
 function renderBody() {
   const rows = state.filtered.slice();
-  const col = COLS.find(c => c.key === state.sortKey) || COLS[0];
+  const col = allColumns().find(c => c.key === state.sortKey) || allColumns()[0];
   const getSort = col.sortVal || (r => r[col.key]);
   rows.sort((a, b) => {
     const va = getSort(a), vb = getSort(b);
@@ -1657,8 +1943,8 @@ function renderBody() {
     if (va > vb) return  1 * state.sortDir;
     return tieBreak(a, b);
   });
-  // Secondary key: Voxy fit descending. That way when the primary column is
-  // price ascending, two $5 tubes surface with the better Voxy fit on top.
+  // Secondary key: target fit descending. That way when the primary column is
+  // price ascending, two $5 tubes surface with the better-fitting one on top.
   function tieBreak(a, b) {
     if (state.sortKey === "voxy_overall") return 0;
     return (b.voxy_overall || 0) - (a.voxy_overall || 0);
@@ -1670,7 +1956,7 @@ function renderBody() {
     const tr = document.createElement("tr");
     if (r.url === state.selectedUrl) tr.className = "selected";
     tr.dataset.url = r.url;
-    COLS.forEach(c => {
+    allColumns().forEach(c => {
       const td = document.createElement("td");
       const cls = typeof c.cls === "function" ? c.cls(r) : c.cls;
       if (cls) td.className = cls;
@@ -1695,14 +1981,10 @@ function selectRow(r) {
 }
 
 function renderDetail(r) {
-  const slots = [
-    {id: "V1",    label: "V1 · Pentode preamp"},
-    {id: "V2t",   label: "V2 · Triode boost"},
-    {id: "V2p",   label: "V2 · SE power"},
-    {id: "combo", label: "Combo · full V2 drop-in"},
-    {id: "PI",    label: "PI · Cathodyne (optional)"},
-    {id: "V2p_B", label: "V2 · PP mate (optional)"},
-  ];
+  const slots = ((state.target && state.target.slots) || []).map(sl => ({
+    id: sl.id,
+    label: sl.label + (sl.optional ? " (optional)" : ""),
+  }));
   let html = `<h2>${escapeHtml(r.name)}
     ${r.matched_key ? `<span class="sub">matched as <b>${escapeHtml(r.matched_key)}</b></span>` : `<span class="sub">not in catalog</span>`}
   </h2>`;
@@ -1800,18 +2082,22 @@ function prettyCat(c) {
 const BUILDS_STORAGE_KEY = "tubehunter-builds-v2";
 const BUILDS_STORAGE_KEY_V1 = "tubehunter-builds-v1";  // legacy — migrated on load
 
-/* Voxy roles that a section can be tagged as. Each section-type has a whitelist. */
-const ROLES = [
-  { id: "V1",    label: "V1 pentode pre",     accepts: ["pentode"] },
-  { id: "V2t",   label: "V2 triode boost",    accepts: ["triode"] },
-  { id: "V2p",   label: "V2 SE power / PP-A", accepts: ["power_pentode", "beam_power", "power_triode"] },
-  { id: "V2p_B", label: "V2 PP-B mate",       accepts: ["power_pentode", "beam_power", "power_triode"] },
-  { id: "PI",    label: "PI cathodyne",       accepts: ["triode"] },
-];
-const ROLE_BY_ID = Object.fromEntries(ROLES.map(r => [r.id, r]));
+
+// Build-role tagging comes straight from the active target's slots. A slot's
+// `requires_element` list is exactly the set of envelope sections that can fill
+// it, so the dropdowns in the build drawer stay correct for any target.
+function roles() {
+  return ((state.target && state.target.slots) || []).map(sl => ({
+    id: sl.id,
+    label: shortSlotLabel(sl),
+    fullLabel: sl.label,
+    accepts: sl.accepts_elements || [],
+  }));
+}
+function roleById(id) { return roles().find(r => r.id === id) || null; }
 
 function rolesForSection(sectionType) {
-  return ROLES.filter(r => r.accepts.includes(sectionType));
+  return roles().filter(r => r.accepts.includes(sectionType));
 }
 
 /* Given a tube's elements list, return per-section descriptors with human labels.
@@ -1924,7 +2210,8 @@ function duplicateBuild(id) {
 }
 
 function promptNewBuild() {
-  const n = prompt("New build name:", `Voxy ${String.fromCharCode(65 + Object.keys(state.builds).length)}`);
+  const base = state.target?.name || "Build";
+  const n = prompt("New build name:", `${base} ${String.fromCharCode(65 + Object.keys(state.builds).length)}`);
   if (n === null) return;
   createBuild(n);
   renderBuildPicker();
@@ -1948,7 +2235,7 @@ function envelopesForTube(url) {
 function ensureActiveBuild() {
   if (state.activeBuildId && state.builds[state.activeBuildId]) return;
   if (!Object.keys(state.builds).length) {
-    createBuild("Voxy A");   // silent first-time create so the first "+" click just works
+    createBuild((state.target?.name || "Build") + " A");  // silent first-time create
   } else {
     state.activeBuildId = Object.keys(state.builds)[0];
   }
@@ -2030,7 +2317,7 @@ function viewBuild(id) {
 
 function clearDetail() {
   state.viewingBuildId = null;
-  document.getElementById("detail").innerHTML = `<div class="empty">Select a tube to see how it scores for each Voxy slot.</div>`;
+  document.getElementById("detail").innerHTML = `<div class="empty">Select a tube to see how it scores for each slot.</div>`;
 }
 
 function buildEnvelopeData(id) {
@@ -2090,8 +2377,9 @@ function renderBuildDrawer(id) {
   const assigned = envData.filter(e => hasAnyRole(e.envelope));
   const unassigned = envData.filter(e => !hasAnyRole(e.envelope));
   const rails = railSummary(envData);
-  const overRailBudget = rails.length > 3;
-  const overRailWarn = rails.length === 3;
+  const maxRails = state.target?.heater_supply?.max_distinct_rails ?? 3;
+  const overRailBudget = rails.length > maxRails;
+  const overRailWarn = rails.length === maxRails;
   const tooBig = assigned.filter(e => e.tube.fits_chassis === false);
   const outOfStock = envData.filter(e => e.tube.in_stock === false);
   const claimed = assignedRoleSet(envData);
@@ -2112,16 +2400,16 @@ function renderBuildDrawer(id) {
   if (!assigned.length) {
     html += `<div class="ok">No tubes assigned to amp slots yet — heater rails and chassis-fit only count assigned tubes.</div>`;
   } else if (overRailBudget) {
-    html += `<div class="warn"><b>Over budget:</b> assigned tubes need ${rails.length} distinct heater rails but the amp only supports 3. Swap something to a shared voltage or drop an assignment.</div>`;
+    html += `<div class="warn"><b>Over budget:</b> assigned tubes need ${rails.length} distinct heater rails but the amp only supports ${maxRails}. Swap something to a shared voltage or drop an assignment.</div>`;
   } else if (overRailWarn) {
-    html += `<div class="warn">Using the maximum 3 heater rails. Any additional assigned tube on a fresh voltage will push over-budget.</div>`;
+    html += `<div class="warn">Using the maximum ${maxRails} heater rails. Any additional assigned tube on a fresh voltage will push over-budget.</div>`;
   } else if (rails.length && !tooBig.length) {
-    html += `<div class="ok">Fits: ${rails.length} heater rail${rails.length===1?"":"s"} used (of 3 available).</div>`;
+    html += `<div class="ok">Fits: ${rails.length} heater rail${rails.length===1?"":"s"} used (of ${maxRails} available).</div>`;
   }
 
   if (tooBig.length) {
     const names = [...new Set(tooBig.map(e => e.tube.name))];
-    html += `<div class="warn"><b>Assigned tube won't fit chassis:</b> ${names.map(escapeHtml).join(", ")}. Voxy only accepts 7-pin or 9-pin sockets.</div>`;
+    html += `<div class="warn"><b>Assigned tube won't fit chassis:</b> ${names.map(escapeHtml).join(", ")}. ${escapeHtml(state.target?.name || "This amp")} accepts ${escapeHtml((state.target?.chassis?.sockets || []).join(", ") || "—")} only.</div>`;
   }
   if (outOfStock.length) {
     const names = [...new Set(outOfStock.map(e => e.tube.name))];
@@ -2245,10 +2533,10 @@ function buildToMarkdown(id) {
   lines.push(summaryBits.join(" · "));
   lines.push("");
 
-  // Roles → envelope table: shows how each Voxy slot gets filled.
+  // Roles → envelope table: shows how each target slot gets filled.
   lines.push("## Role assignments");
   const roleTable = [];
-  for (const r of ROLES) {
+  for (const r of roles()) {
     const claimants = [];
     envData.forEach((ed, i) => {
       for (const [si, rid] of Object.entries(ed.envelope.roles || {})) {
@@ -2276,7 +2564,7 @@ function buildToMarkdown(id) {
     const sectRoles = sections.length
       ? sections.map(s => {
           const rid = env.roles[s.idx];
-          const roleLabel = rid ? ROLE_BY_ID[rid]?.label || rid : "—";
+          const roleLabel = rid ? roleById(rid)?.fullLabel || rid : "—";
           return `${s.label} → ${roleLabel}`;
         }).join(", ")
       : "—";
@@ -2290,7 +2578,8 @@ function buildToMarkdown(id) {
   for (const r of rails) {
     lines.push(`- **${r.v} V** — ${r.count}× envelope${r.count===1?"":"s"}${r.amps ? " · " + r.amps.toFixed(2) + " A" : ""} (${r.names.join(", ")})`);
   }
-  if (rails.length > 3) lines.push(`- ⚠ **Over 3-rail budget** — Voxy amp supports 3 distinct heater voltages max.`);
+  const maxRails = state.target?.heater_supply?.max_distinct_rails ?? 3;
+  if (rails.length > maxRails) lines.push(`- ⚠ **Over ${maxRails}-rail budget** — ${state.target?.name || "this amp"} supports ${maxRails} distinct heater voltages max.`);
   return lines.join("\n");
 }
 
@@ -2791,6 +3080,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "refresh_in_progress": app.runner.in_progress,
             })
             return
+        if self.path == "/api/targets":
+            self._send_json(app.target_summary())
+            return
         if self.path == "/api/pending-cart":
             with app.pending_cart_lock:
                 snap = dict(app.pending_cart)
@@ -2844,6 +3136,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
             result = app.runner.start()
             self._send_json(result)
             return
+        if self.path in ("/api/target/select", "/api/target/import", "/api/target/delete"):
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            try:
+                payload = json.loads((self.rfile.read(length) if length else b"").decode("utf-8") or "{}")
+            except Exception:
+                self._send_json({"error": "invalid JSON"}, status=400)
+                return
+
+            if self.path == "/api/target/select":
+                try:
+                    app.set_target(payload.get("id"))
+                except KeyError:
+                    self._send_json({"error": "unknown target"}, status=404)
+                    return
+                self._send_json({"ok": True, **app.target_summary()})
+                return
+
+            if self.path == "/api/target/delete":
+                try:
+                    app.targets.delete(payload.get("id"))
+                except KeyError:
+                    self._send_json({"error": "unknown target"}, status=404)
+                    return
+                app.ranker = app.targets.ranker()
+                app.rescore()
+                if getattr(app, "runner", None):
+                    app.runner.ranker = app.ranker
+                self._send_json({"ok": True, **app.target_summary()})
+                return
+
+            # /api/target/import — accepts a Filament Studio chain export, or a
+            # target file already in TubeHunter's own schema.
+            doc = payload.get("document")
+            if isinstance(doc, str):
+                try:
+                    doc = json.loads(doc)
+                except Exception as exc:
+                    self._send_json({"error": f"not valid JSON: {exc}"}, status=400)
+                    return
+            if not isinstance(doc, dict):
+                self._send_json({"error": "missing 'document'"}, status=400)
+                return
+            try:
+                if doc.get("schema") == "tubehunter-target/1":
+                    target = doc
+                elif "stages" in doc:
+                    target = target_from_filament_studio(doc)
+                else:
+                    raise ValueError("unrecognised file — expected a Filament Studio "
+                                     "chain export or a TubeHunter target")
+                tid = app.targets.save(target)
+                app.set_target(tid)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"ok": True, "imported": tid, **app.target_summary()})
+            return
+
         if self.path == "/api/pending-cart":
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b""
@@ -2910,20 +3260,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class TubeHunterApp:
     def __init__(self):
         self.catalog = Catalog(CATALOG_PATH)
-        self.ranker = VoxyRanker(VOXY_PATH)
+        self.targets = TargetLibrary(TARGETS_DIR, SETTINGS_PATH)
+        self.ranker = self.targets.ranker()
         self.snapshot = Snapshot(SNAPSHOT_PATH)
         # Ephemeral cart shared with the tubestore bookmarklet. The frontend POSTs
         # a build's shopping list here; the bookmarklet (running on tubestore.com)
         # GETs it and adds each line to the user's real cart.
         self.pending_cart = {"items": [], "updated_at": None}
         self.pending_cart_lock = threading.Lock()
-        # re-score existing snapshot against current catalog/voxy configs on boot,
-        # preserving the raw store fields so the UI still shows price/stock/etc.
-        prods = self.snapshot.data.get("products") or []
-        if prods:
-            raw = [{k: p.get(k) for k in PASSTHROUGH_FIELDS} for p in prods]
-            self.snapshot.data["products"] = enrich(raw, self.catalog, self.ranker)
+        self.rescore()
         self.runner = RefreshRunner(self.snapshot, self.catalog, self.ranker)
+
+    def rescore(self):
+        """Re-run classification + slot scoring over the stored snapshot using the
+        currently active target. Called on boot and whenever the target changes;
+        the raw store fields (price, stock, url) are preserved untouched."""
+        prods = self.snapshot.data.get("products") or []
+        if not prods:
+            return
+        raw = [{k: p.get(k) for k in PASSTHROUGH_FIELDS} for p in prods]
+        self.snapshot.data["products"] = enrich(raw, self.catalog, self.ranker)
+
+    def set_target(self, tid):
+        self.targets.set_active(tid)
+        self.ranker = self.targets.ranker()
+        self.rescore()
+        if getattr(self, "runner", None):
+            self.runner.ranker = self.ranker
+
+    def target_summary(self):
+        """Everything the frontend needs to render slot columns and labels."""
+        t = self.targets.active
+        return {
+            "active": self.targets.active_id,
+            "name": t.get("name", "Amp"),
+            "description": t.get("description", ""),
+            "chassis": t.get("chassis", {}),
+            "heater_supply": t.get("heater_supply", {}),
+            "slots": [
+                {
+                    "id": sid,
+                    "label": spec.get("label", sid),
+                    "role": spec.get("role", ""),
+                    "notes": spec.get("notes", ""),
+                    "optional": spec.get("role", "").strip().upper().startswith("OPTIONAL"),
+                    # which envelope sections can fill this slot — drives the
+                    # per-section role dropdowns in the build drawer
+                    "accepts_elements": spec.get("requires_element", []),
+                }
+                for sid, spec in t.get("slots", {}).items()
+            ],
+            "available": [
+                {"id": tid, "name": tt.get("name", tid),
+                 "description": tt.get("description", ""),
+                 "source": tt.get("source", "manual"),
+                 "slot_count": len(tt.get("slots", {}))}
+                for tid, tt in self.targets.targets.items()
+            ],
+        }
 
 def ensure_ssl_cert():
     """Generate a long-lived self-signed cert for localhost the first time we
@@ -3008,7 +3402,7 @@ def crawl_and_save(max_pages: int | None):
     if max_pages is not None:
         MAX_PAGES_PER_REFRESH = max_pages
     catalog = Catalog(CATALOG_PATH)
-    ranker = VoxyRanker(VOXY_PATH)
+    ranker = TargetLibrary(TARGETS_DIR, SETTINGS_PATH).ranker()
     snap = Snapshot(SNAPSHOT_PATH)
     def log(msg): print(f"[crawl] {msg}", file=sys.stderr)
     raw = Scraper(on_progress=log).crawl()
@@ -3078,8 +3472,26 @@ def main():
                 except Exception as exc:
                     return {"ok": False, "error": str(exc)}
 
+            def open_json(self):
+                """Native Open… panel for importing an amp target (e.g. a
+                Filament Studio chain export). Returns the file's text."""
+                win = webview.windows[0]
+                paths = win.create_file_dialog(
+                    webview.OPEN_DIALOG,
+                    allow_multiple=False,
+                    file_types=("JSON Files (*.json)", "All files (*.*)"),
+                )
+                if not paths:
+                    return {"ok": False, "cancelled": True}
+                path = paths[0] if isinstance(paths, (list, tuple)) else paths
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        return {"ok": True, "text": f.read(), "path": path}
+                except Exception as exc:
+                    return {"ok": False, "error": str(exc)}
+
         webview.create_window(
-            "TubeHunter · Voxy",
+            f"TubeHunter · {app.targets.active.get('name', '')}",
             url,
             width=1440, height=900,
             resizable=True,

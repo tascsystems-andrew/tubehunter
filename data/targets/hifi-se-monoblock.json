@@ -1,0 +1,62 @@
+{
+  "schema": "tubehunter-target/1",
+  "id": "hifi-se-monoblock",
+  "name": "HiFi SE Monoblock",
+  "description": "Single-ended class-A monoblock power amp, fed from a line-level preamp. One small-signal driver into one triode-strapped output tube, ~8–12 W into 8 Ω. Sized for ~87 dB speakers (TriTrix MTM TL and modded Sony bookshelfs).",
+  "source": "manual",
+
+  "chassis": {
+    "sockets": ["B7G", "noval", "octal", "loctal", "UX4", "UX5", "magnoval"],
+    "note": "Standalone monoblock chassis — plenty of room, so octal and the bigger transmitting bases are all fair game. Compactron and duodecar excluded only because sockets are scarce."
+  },
+
+  "heater_supply": {
+    "type": "dedicated windings / buck-boost",
+    "v_max": 40,
+    "max_distinct_rails": 3,
+    "existing_rails_v": [6.3],
+    "note": "Power transformer supplies 6.3 V; a second winding or buck-boost covers 12.6 V and 5 V rectifier rails."
+  },
+
+  "rails": { "b_plus_v": 360 },
+  "output": { "opt": "SE ~5k primary, 8 Ω secondary, gapped for ~60 mA DC (Edcor CXSE25-8-5K / Hammond 1628SE)" },
+
+  "slots": {
+    "driver": {
+      "label": "Driver · voltage gain",
+      "role": "Single gain stage taking line level up to the output grid's swing requirement (~21 V RMS).",
+      "accepts": { "triode_pre": 2.0, "pentode_pre": 1.8 },
+      "requires_element": ["triode", "pentode"],
+      "socket": { "preferred": ["noval", "B7G"], "pref_score": 1.0, "acceptable": { "octal": 0.6, "loctal": 0.4 } },
+      "mu_bands": [
+        [25, 70, 1.2, "enough gain for line level in one stage"],
+        [71, 120, 0.8, "plenty of gain, watch headroom"],
+        [15, 24, 0.5, "marginal from line level"],
+        [1, 14, 0.1, "too low-µ to drive the output alone"]
+      ],
+      "notes": "Preamp already delivers about 1 V RMS, so roughly 25× gain covers full output. Frame-grid industrial types (E180F triode-strapped, EC8010, 5842/417A) are quiet and very linear here."
+    },
+
+    "output": {
+      "label": "Output · SE class-A",
+      "role": "Single-ended output tube, triode-strapped where it's a pentode/beam type.",
+      "accepts": { "power": 2.0, "combo": 1.0 },
+      "requires_element": ["power_pentode", "beam_power", "power_triode"],
+      "socket": { "preferred": ["octal", "UX4", "UX5"], "pref_score": 1.0, "acceptable": { "noval": 0.7, "magnoval": 0.6, "loctal": 0.4 } },
+      "va_min": 300,
+      "pd_range": [20, 45],
+      "pd_over_score": 0.4,
+      "notes": "Triode-strapped SE gives roughly a third of plate dissipation as clean watts, so 20 W+ of dissipation is what gets you to 8–12 W output. That is the level ~87 dB speakers actually want."
+    },
+
+    "rectifier": {
+      "label": "Rectifier · optional tube",
+      "role": "OPTIONAL — tube rectification for the softer, more dynamic supply behaviour. Solid-state is the tighter alternative.",
+      "accepts": { "rectifier": 2.0 },
+      "requires_element": ["diode"],
+      "socket": { "preferred": ["octal"], "pref_score": 1.0, "acceptable": { "noval": 0.8, "UX4": 0.5 } },
+      "va_min": 350,
+      "notes": "5Y3 sags most, 5AR4/GZ34 is stiffer and higher-current, EZ81 is the 9-pin option. Skip entirely and use UF4007s for the tightest bass."
+    }
+  }
+}

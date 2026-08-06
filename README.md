@@ -6,8 +6,11 @@ a local reference of ~1,300 tube types, and ranks each result for a specific
 amp's socket / heater / dissipation / vibe constraints — all in an
 iTunes-classic table with a native macOS window.
 
-Built as a personal utility for a modular Vox-inspired guitar amp ("Voxy") but
-the amp spec is a single JSON file — swap it and the rankings retarget.
+Rankings are driven by an **amp target** — a JSON description of a chassis,
+heater supply, and tube slots. Ship with two: a modular Vox-inspired guitar amp
+("Voxy") and a hi-fi SE monoblock. Switch targets from the toolbar and the whole
+inventory re-scores; import a new target directly from a
+[Filament Studio](https://github.com/tascsystems-andrew) chain export.
 
 ![screenshot placeholder](docs/screenshot.png)
 
@@ -20,13 +23,12 @@ the amp spec is a single JSON file — swap it and the rankings retarget.
   variants inherit from their 6V parent.
 - **Live pricing** in CAD (or USD) via thetubestore's SuiteCommerce items JSON
   API. Rate-limited to 3 full refreshes / 24 h; a full crawl takes ~5 minutes.
-- **Voxy amp ranking** across six slots:
-  - V1 pentode preamp
-  - V2 triode boost
-  - V2 SE power / PP-A output
-  - Full combo drop-in
-  - PI cathodyne (optional PP conversion)
-  - V2p_B PP-mate (optional second output)
+- **Target-driven ranking** — every slot column, sidebar entry, chassis rule,
+  heater-rail budget and build-role dropdown comes from the active target file
+  (`data/targets/*.json`). One generic scoring engine, zero per-amp code.
+- **Filament Studio import** — the `import…` button accepts a Filament Studio
+  chain export (`schemaVersion: 1`) unchanged and converts each tube stage into
+  a slot bracketing the designed operating point.
 - **Envelope-based builds** ("playlists") with per-section role tagging.
   Assign one 11BM8's triode to V2t and its pentode to V2p, another 11BM8's
   triode to PI and its pentode to V2p_B, etc. Shopping list consolidates
@@ -74,7 +76,7 @@ tubehunter.py            Single-file server + scraper + ranker + embedded HTML/C
 build_catalog.py         Compact declarative source for the tube knowledge base
 data/
 ├── catalog.json         Generated: ~1,300 tube classifications
-└── voxy.json            Editable: amp slot definitions + heater rules
+└── targets/             Amp target definitions (Voxy, HiFi SE monoblock, yours…)
 TubeHunter.app/          macOS .app bundle with launcher + custom .icns icon
 ```
 
@@ -83,14 +85,17 @@ gitignored — it's regenerated on first run.
 
 ## Targeting a different amp
 
-`data/voxy.json` defines the six scoring slots, the amp's B+ rail, and the
-heater-supply rules. Rewrite it for your amp and the rankings, warnings, and
-"top pick" columns retarget without touching the code.
+Drop a JSON file in `data/targets/` (schema `tubehunter-target/1`) and pick it
+from the toolbar. A target declares:
 
-Slot categories the ranker understands: `pentode_pre`, `triode_pre`, `power`,
-`combo` (triode+power-pentode envelope). Additional constraints per slot:
-socket, heater voltage options, plate voltage range, dissipation range, µ
-range, preferred cutoff.
+- `chassis.sockets` — which bases physically fit (hard filter)
+- `heater_supply` — max voltage, distinct-rail budget, existing rails
+- `slots` — each with `accepts` (category → base score), `requires_element`,
+  socket preferences, `mu_bands`, `pd_range`, `va_min`, cutoff preference
+
+Or design the amp in Filament Studio and use **import…** — the converter turns
+each tube stage into a slot automatically. See `data/targets/*.json` for two
+worked examples.
 
 ## Adding tubes to the catalog
 

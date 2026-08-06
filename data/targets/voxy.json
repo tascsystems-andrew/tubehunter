@@ -1,0 +1,101 @@
+{
+  "schema": "tubehunter-target/1",
+  "id": "voxy",
+  "name": "Voxy",
+  "description": "Modular single-ended guitar amp, AC4-inspired, ~4 W. EF94 pentode front end into a PCL86 (triode boost + SE power pentode). Optional cathodyne PI + second output tube converts it to push-pull.",
+  "source": "manual",
+
+  "chassis": {
+    "sockets": ["B7G", "noval"],
+    "note": "Chassis punches accept 7-pin B7G or 9-pin noval only. Octal, UX, loctal, compactron, magnoval and duodecar are all physically too large."
+  },
+
+  "heater_supply": {
+    "type": "buck-boost, per-rail",
+    "v_max": 37,
+    "max_distinct_rails": 3,
+    "existing_rails_v": [6.3, 13.0],
+    "note": "EF94 runs on 6.3 V, PCL86 on 13 V. Anything at or under 37 V is reachable; a tube that matches an existing rail avoids spending one of the three."
+  },
+
+  "rails": { "b_plus_v": 305 },
+  "output": { "opt": "Hammond 1750C SE (~5k primary)" },
+
+  "slots": {
+    "V1": {
+      "label": "V1 · Pentode preamp",
+      "role": "Front-end pentode voltage gain into the HOWL level pot.",
+      "accepts": { "pentode_pre": 2.0 },
+      "requires_element": ["pentode"],
+      "socket": { "preferred": ["B7G"], "pref_score": 1.0, "acceptable": { "noval": 0.4 } },
+      "cutoff": { "prefer": "sharp", "bonus": 0.7, "penalty_remote": -1.0 },
+      "notes": "Runs off B+3 through a 100k plate resistor; the 470k screen feed deliberately starves it for headroom. Remote-cutoff pentodes distort on audio — avoid. EF86 needs the noval socket but is the sonic prize."
+    },
+
+    "V2t": {
+      "label": "V2 triode · Boost",
+      "role": "Triode gain stage feeding the cold-clip and SIZZLE pot.",
+      "accepts": { "triode_pre": 2.0, "combo": 1.2 },
+      "requires_element": ["triode"],
+      "socket": { "preferred": ["noval"], "pref_score": 1.0 },
+      "mu_bands": [
+        [30, 100, 1.0, "in the boost sweet spot"],
+        [15, 29, 0.4, "low for a boost stage but usable"],
+        [101, 200, 0.3, "very high gain, will clip early"]
+      ],
+      "notes": "A standalone triode fits here if you split the PCL86 into two envelopes. The 12AX7 family is a socket drop-in; the buck-boost heater supply makes 12.6 V a non-issue."
+    },
+
+    "V2p": {
+      "label": "V2 pentode · SE output",
+      "role": "Single-ended power pentode into the 1750C.",
+      "accepts": { "power": 2.0, "combo": 1.5 },
+      "requires_element": ["power_pentode", "beam_power", "power_triode"],
+      "socket": { "preferred": ["noval"], "pref_score": 1.0, "acceptable": { "octal": 0.2 } },
+      "va_min": 250,
+      "pd_range": [5, 15],
+      "pd_over_score": 0.2,
+      "notes": "SE class-A into a ~5k primary favours the EL84/6BQ5 class. Above 15 W of dissipation is wasted here and eats heater budget."
+    },
+
+    "combo": {
+      "label": "Combo · full V2 drop-in",
+      "role": "Triode preamp plus SE power pentode in one envelope — a direct PCL86 replacement.",
+      "accepts": { "combo": 2.0 },
+      "requires_element": ["power_pentode", "beam_power"],
+      "socket": { "preferred": ["noval"], "pref_score": 1.0 },
+      "pd_range": [4, 12],
+      "mu_bands": [[30, 100, 0.5, "triode section in range"]],
+      "prefer_hv": 13.0,
+      "notes": "13 V heater lands straight on the PCL86 rail. The 6.3 V variants (ECL82/86, 6BM8, 6GW8) join the EF94 rail instead — equally fine."
+    },
+
+    "PI": {
+      "label": "PI · Cathodyne phase inverter",
+      "role": "OPTIONAL — one triode section as a split-load inverter feeding a push-pull output pair.",
+      "accepts": { "triode_pre": 2.0, "combo": 1.2 },
+      "requires_element": ["triode"],
+      "socket": { "preferred": ["noval"], "pref_score": 1.0, "acceptable": { "octal": 0.6 } },
+      "mu_bands": [
+        [15, 30, 1.2, "ideal cathodyne — clean, linear split"],
+        [31, 60, 0.9, "solid cathodyne (12AY7/5751 territory)"],
+        [61, 90, 0.7, "usable (12AT7 class)"],
+        [91, 200, 0.5, "high gain — works Fender-style but less headroom"],
+        [1, 14, 0.3, "very low µ, wants more gain upstream"]
+      ],
+      "notes": "Cathodyne gain is about unity, so low-µ triodes give the cleanest split. Only relevant if you build the push-pull option."
+    },
+
+    "V2p_B": {
+      "label": "V2 · PP second power valve",
+      "role": "OPTIONAL — second output tube for a push-pull stage (needs a PP output transformer).",
+      "accepts": { "power": 2.0, "combo": 1.5 },
+      "requires_element": ["power_pentode", "beam_power", "power_triode"],
+      "socket": { "preferred": ["noval"], "pref_score": 1.0, "acceptable": { "octal": 0.2 } },
+      "va_min": 250,
+      "pd_range": [5, 15],
+      "pd_over_score": 0.2,
+      "notes": "Same tube type as V2p — buy a matched pair. Shares the V2p heater rail, so it costs no extra rail."
+    }
+  }
+}
