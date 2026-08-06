@@ -1,0 +1,149 @@
+{
+  "schema": "tubehunter-target/1",
+  "id": "vox-ac4",
+  "name": "Vox AC4",
+  "description": "4 W single-ended EL84 with EF86 preamp \u2014 bedroom hi-fi tube tone. Values from the original V-1-1 schematic.",
+  "source": "filament-studio",
+  "chassis": {
+    "sockets": [
+      "B7G",
+      "noval",
+      "octal"
+    ],
+    "note": "Imported permissively. Edit this list to match your real chassis punches."
+  },
+  "heater_supply": {
+    "type": "imported",
+    "v_max": null,
+    "max_distinct_rails": 3,
+    "existing_rails_v": [
+      6.3
+    ],
+    "note": "Rails taken from the heater voltages the Filament Studio design uses; other voltages are allowed but flagged."
+  },
+  "rails": {
+    "b_plus_v": 270
+  },
+  "slots": {
+    "V1_EF86": {
+      "label": "V1 (EF86) \u00b7 EF86",
+      "role": "Imported from Filament Studio \u2014 designed around EF86, gain -93.14\u00d7, Q-point 153.22 V / 0.197 mA",
+      "accepts": {
+        "pentode_pre": 2.0
+      },
+      "requires_element": [
+        "pentode"
+      ],
+      "socket": {
+        "preferred": [
+          "noval",
+          "B7G"
+        ],
+        "pref_score": 1.0,
+        "acceptable": {
+          "octal": 0.6
+        }
+      },
+      "notes": "Filament Studio stage 2 (pentode-pre). Heater 6.3 V. Original tube EF86, \u00b5=38, pDiss 1 W.",
+      "_filament": {
+        "stage_idx": 2,
+        "tube": "EF86",
+        "topology": "cc-cb",
+        "qPoint": {
+          "Vp": 153.22,
+          "Ip_mA": 0.197,
+          "Vg": -0.21,
+          "Vg2": 22.14,
+          "Vk": null,
+          "Pdiss_W": 0.03,
+          "gm_mAV": 0
+        },
+        "smallSignal": {
+          "Av": -93.14,
+          "Zout_ohm": 238128,
+          "maxCleanSwing_Vpp": null,
+          "fLow_Hz": 5
+        },
+        "heater": {
+          "Vnom": 6.3,
+          "Vset": 6.3,
+          "Iamps": 0.2,
+          "emissionPct": 100
+        }
+      },
+      "va_min": 201,
+      "mu_bands": [
+        [
+          30,
+          47,
+          1.0,
+          "close to the designed \u00b5=38"
+        ],
+        [
+          19,
+          76,
+          0.5,
+          "in range of the designed \u00b5=38"
+        ]
+      ],
+      "prefer_hv": 6.3
+    },
+    "Power_EL84": {
+      "label": "Power EL84 \u00b7 EL84",
+      "role": "Imported from Filament Studio \u2014 designed around EL84, gain -1.75\u00d7, Q-point 250 V / 50 mA",
+      "accepts": {
+        "power": 2.0,
+        "combo": 1.5
+      },
+      "requires_element": [
+        "power_pentode",
+        "beam_power",
+        "power_triode"
+      ],
+      "socket": {
+        "preferred": [
+          "noval",
+          "B7G"
+        ],
+        "pref_score": 1.0,
+        "acceptable": {
+          "octal": 0.6
+        }
+      },
+      "notes": "Filament Studio stage 4 (pa-se). Heater 6.3 V. Original tube EL84, \u00b5=19.5, pDiss 12 W.",
+      "_filament": {
+        "stage_idx": 4,
+        "tube": "EL84",
+        "topology": "cc-cb",
+        "qPoint": {
+          "Vp": 250,
+          "Ip_mA": 50,
+          "Vg": 0,
+          "Vg2": 19.23,
+          "Vk": null,
+          "Pdiss_W": 12.5,
+          "gm_mAV": 0
+        },
+        "smallSignal": {
+          "Av": -1.75,
+          "Zout_ohm": 400,
+          "maxCleanSwing_Vpp": null,
+          "fLow_Hz": 60
+        },
+        "heater": {
+          "Vnom": 6.3,
+          "Vset": 6.3,
+          "Iamps": 0.76,
+          "emissionPct": 100
+        }
+      },
+      "pd_range": [
+        7.2,
+        19.2
+      ],
+      "pd_over_score": 0.3,
+      "va_min": 270,
+      "prefer_hv": 6.3
+    }
+  }
+}

@@ -336,8 +336,12 @@ def target_from_filament_studio(doc: dict) -> dict:
     amp = doc.get("amp") or {}
     name = amp.get("name") or "Imported amp"
 
-    TUBE_STAGES = {"triode", "pentode"}
-    tube_stages = [s for s in stages if s.get("type") in TUBE_STAGES and s.get("tube")]
+    # A tube stage is any stage carrying a tube object. The `type` field is the
+    # BLOCK type ("pentode-pre", "pa-se", "triode-pre", …), which varies with the
+    # editor palette — matching on it was exactly how v1 of this importer managed
+    # to find zero tubes in a real export.
+    tube_stages = [s for s in stages
+                   if isinstance(s.get("tube"), dict) and (s["tube"].get("name") or "").strip()]
     if not tube_stages:
         raise ValueError("no tube stages found — is this a Filament Studio chain export?")
 
@@ -365,9 +369,16 @@ def target_from_filament_studio(doc: dict) -> dict:
         mu = model.get("mu")
         qp_diss = q.get("Pdiss_W") or 0
 
-        # A stage dissipating more than ~2 W is doing power work; below that it's
-        # small-signal. That split decides which catalog categories can fill it.
-        is_power = bool(pdiss and pdiss >= 6 and qp_diss >= 1.5)
+        # The block type names the job when it can: "pa-se"/"pa-pp" are power-amp
+        # blocks, "…-pre" blocks are preamps. Unknown block types fall back to a
+        # dissipation heuristic: a stage burning real watts is doing power work.
+        btype = (s.get("type") or "").lower()
+        if btype.startswith("pa"):
+            is_power = True
+        elif btype.endswith("-pre") or "pre" in btype:
+            is_power = False
+        else:
+            is_power = bool(pdiss and pdiss >= 6 and qp_diss >= 1.5)
 
         if is_power:
             accepts = {"power": 2.0, "combo": 1.5}
@@ -1547,7 +1558,7 @@ async function importTargetDialog() {
   } else {
     text = await new Promise(resolve => {
       const inp = document.createElement("input");
-      inp.type = "file"; inp.accept = ".json,application/json";
+      inp.type = "file"; inp.accept = ".json,.filament,application/json";
       inp.onchange = () => {
         const f = inp.files?.[0];
         if (!f) return resolve(null);
@@ -3491,7 +3502,8 @@ def main():
                 paths = win.create_file_dialog(
                     webview.OPEN_DIALOG,
                     allow_multiple=False,
-                    file_types=("JSON Files (*.json)", "All files (*.*)"),
+                    file_types=("Filament Studio (*.filament)",
+                                "JSON Files (*.json)", "All files (*.*)"),
                 )
                 if not paths:
                     return {"ok": False, "cancelled": True}
