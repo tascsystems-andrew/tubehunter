@@ -446,11 +446,15 @@ def target_from_filament_studio(doc: dict) -> dict:
         "chassis": {"sockets": sockets,
                     "note": "Imported permissively. Edit this list to match your real chassis punches."},
         "heater_supply": {
+            # No v_max: the designed rails earn a share-a-rail bonus, but a tube
+            # wanting its own voltage only costs the "dedicated rail" note — in a
+            # scratch build the heater winding is the cheapest thing to change,
+            # so it must never hard-zero an otherwise perfect candidate.
             "type": "imported",
-            "v_max": max(rails + [6.3]) if rails else 6.3,
+            "v_max": None,
             "max_distinct_rails": max(3, len(rails)),
             "existing_rails_v": rails,
-            "note": "Rails taken from the heater voltages the Filament Studio design uses.",
+            "note": "Rails taken from the heater voltages the Filament Studio design uses; other voltages are allowed but flagged.",
         },
         "rails": {"b_plus_v": b_plus} if b_plus else {},
         "slots": slots,
@@ -3183,6 +3187,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     target = doc
                 elif "stages" in doc:
                     target = target_from_filament_studio(doc)
+                elif "blockType" in doc or {"tube", "topo", "bplus"} <= set(doc):
+                    # Filament Studio's per-stage summary (saved with a non-amp
+                    # block selected). It has no chain in it, so there's nothing
+                    # to build slots from — steer the user to the full export.
+                    raise ValueError(
+                        "this is a per-stage Filament Studio export — select the "
+                        "Amp block in Filament Studio and hit 💾 Save .json to get "
+                        "the full chain")
                 else:
                     raise ValueError("unrecognised file — expected a Filament Studio "
                                      "chain export or a TubeHunter target")
