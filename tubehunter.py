@@ -1174,6 +1174,8 @@ INDEX_HTML = r"""<!doctype html>
     border: 1px solid #d0b8e8; border-radius: 4px; cursor: pointer;
   }
   .fs-sync:hover { background: #e0c8ff; }
+  .fs-sync.live { color: #1e5a2c; background: #dcf0dd; border-color: #4c9c50; }
+  .fs-sync.live:hover { background: #cbe8cd; }
   .export-btn {
     font: inherit; font-size: 11px; padding: 3px 10px;
     border: 1px solid var(--border); border-radius: 4px;
@@ -1583,10 +1585,34 @@ async function boot() {
     if (!state.activeBuildId) { flashToast("No amp selected"); return; }
     pushSelectionsToFilament(state.activeBuildId);
   });
+  pingFilamentStudio();
+  setInterval(pingFilamentStudio, 30000);
   initFilterPopover();
   // The native app adds to the store cart directly — the bookmarklet (and its
   // setup link) only matters when TubeHunter runs in a plain browser.
   if (window.pywebview) document.querySelector(".cart-setup")?.remove();
+}
+
+// Filament Studio's integration API answers GET /api/ping with
+// {ok, app: "filament-studio", api: [...]} — poll it so the sync button shows
+// whether a push will land live (amp recomputes) or fall back to a file.
+async function pingFilamentStudio() {
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 800);
+    const r = await fetch("http://127.0.0.1:8767/api/ping", {signal: ctl.signal});
+    clearTimeout(t);
+    const j = r.ok ? await r.json() : null;
+    state.fsLive = !!(j && j.ok && j.app === "filament-studio");
+  } catch (e) { state.fsLive = false; }
+  const btn = document.getElementById("fsSync");
+  if (btn) {
+    btn.classList.toggle("live", !!state.fsLive);
+    btn.textContent = state.fsLive ? "⇄ Filament Studio ●" : "⇄ Filament Studio";
+    btn.title = state.fsLive
+      ? "Filament Studio is running — selections push live and the amp recomputes"
+      : "Push this amp's tagged tube selections to Filament Studio — saves a file (Studio isn't running)";
+  }
 }
 
 function initFilterPopover() {
