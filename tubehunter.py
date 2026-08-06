@@ -1575,6 +1575,9 @@ async function boot() {
   });
   document.getElementById("exportCsv").addEventListener("click", exportInventoryCsv);
   initFilterPopover();
+  // The native app adds to the store cart directly — the bookmarklet (and its
+  // setup link) only matters when TubeHunter runs in a plain browser.
+  if (window.pywebview) document.querySelector(".cart-setup")?.remove();
 }
 
 function initFilterPopover() {
