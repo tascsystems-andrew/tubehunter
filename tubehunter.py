@@ -1168,6 +1168,12 @@ INDEX_HTML = r"""<!doctype html>
     color: #4c1c7a; background: #f0dcff; border-radius: 8px;
     padding: 0 6px; font-size: 10px; white-space: nowrap;
   }
+  .fs-sync {
+    font: inherit; font-size: 11px; padding: 3px 10px;
+    color: #4c1c7a; background: #f0dcff;
+    border: 1px solid #d0b8e8; border-radius: 4px; cursor: pointer;
+  }
+  .fs-sync:hover { background: #e0c8ff; }
   .export-btn {
     font: inherit; font-size: 11px; padding: 3px 10px;
     border: 1px solid var(--border); border-radius: 4px;
@@ -1419,7 +1425,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div id="statusbar">
     <a href="/bookmarklet" target="_blank" rel="noopener" class="cart-setup" title="One-time setup for the store-cart bookmarklet">🛒 cart setup</a>
-    <button id="exportCsv" class="export-btn" title="Download all crawled inventory as CSV (regardless of chassis fit, filters, or classification)">Export CSV</button>
+    <button id="fsSync" class="fs-sync" title="Push this amp's tagged tube selections to Filament Studio — live API when it's running, save-file otherwise">⇄ Filament Studio</button>
     <div class="meta" id="meta">loading…</div>
   </div>
   <div id="main">
@@ -1573,7 +1579,10 @@ async function boot() {
     renderSidebar();
     applyFilter();
   });
-  document.getElementById("exportCsv").addEventListener("click", exportInventoryCsv);
+  document.getElementById("fsSync")?.addEventListener("click", () => {
+    if (!state.activeBuildId) { flashToast("No amp selected"); return; }
+    pushSelectionsToFilament(state.activeBuildId);
+  });
   initFilterPopover();
   // The native app adds to the store cart directly — the bookmarklet (and its
   // setup link) only matters when TubeHunter runs in a plain browser.
@@ -1923,6 +1932,7 @@ function renderSidebar() {
     {label: "All tubes", key: {kind: "all"}, count: pool.length},
     {label: "Classified", key: {kind: "classified"}, count: pool.filter(r => r.classified).length},
     {label: "Unknown / uncatalogued", key: {kind: "unknown"}, count: pool.filter(r => !r.classified).length},
+    {label: "⤓ Export inventory CSV", key: {kind: "export-csv"}, count: ""},
     {header: "By type"},
     {label: "Pentode preamp", key: {kind: "cat", val: "pentode_pre"}, count: counts["pentode_pre"] || 0},
     {label: "Triode preamp",  key: {kind: "cat", val: "triode_pre"},  count: counts["triode_pre"] || 0},
@@ -1979,6 +1989,10 @@ function renderSidebar() {
     d.addEventListener("click", () => {
       if (g.key.kind === "new-build") {
         promptNewBuild();
+        return;
+      }
+      if (g.key.kind === "export-csv") {
+        exportInventoryCsv();
         return;
       }
       if (g.key.kind === "build") {
@@ -2535,7 +2549,6 @@ function renderBuildDrawer(id) {
   } else {
     html += `<button class="primary" onclick="pushBuildToStoreCart('${b.id}')" title="Sync this build to TubeHunter's pending cart so the store-cart bookmarklet can add them in one click">Push to store cart ↗</button>`;
   }
-  html += `<button onclick="pushSelectionsToFilament('${b.id}')" title="Export the tagged tube choices so Filament Studio can swap them into the design and recompute the whole amp">→ Filament Studio</button>`;
   html += `<button onclick="copyBuildSummary('${b.id}')">Copy summary</button>`;
   html += `<button onclick="renameBuild('${b.id}')">Rename</button>`;
   html += `<button onclick="duplicateBuild('${b.id}')">Duplicate</button>`;
