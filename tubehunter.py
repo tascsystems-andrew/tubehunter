@@ -2808,8 +2808,8 @@ async function pushSelectionsToFilament(id) {
   const doc = buildSelections(id);
   if (!doc) return;
   if (!doc.selections.length) {
-    alert("No tubes are tagged to slots yet — assign roles in this drawer first. "
-        + "Only role-tagged envelopes get pushed (cart-only extras stay behind).");
+    flashToast("Nothing tagged yet — assign tubes to slots in the build drawer first");
+    viewActiveBuild();
     return;
   }
   const json = JSON.stringify(doc, null, 2);
@@ -3989,7 +3989,33 @@ def main():
         # cookies + localStorage + IndexedDB under ~/Library/Application Support.
         storage = Path.home() / "Library" / "Application Support" / "TubeHunter"
         storage.mkdir(parents=True, exist_ok=True)
-        webview.start(private_mode=False, storage_path=str(storage))
+        def _cocoa_identity():
+            # Runs after the run loop starts. The pre-start swap fixes the menu
+            # title, but Cocoa re-applies the interpreter bundle's icon during
+            # activation — and NSAlert (JS alert dialogs) reads exactly that.
+            # Re-applying on the main queue after launch makes it stick.
+            try:
+                from AppKit import NSApplication, NSImage, NSOperationQueue  # type: ignore
+                from Foundation import NSBundle  # type: ignore
+
+                def apply():
+                    info = (NSBundle.mainBundle().localizedInfoDictionary()
+                            or NSBundle.mainBundle().infoDictionary())
+                    if info is not None:
+                        info["CFBundleName"] = "TubeHunter"
+                        info["CFBundleDisplayName"] = "TubeHunter"
+                    for icns in (Path("/Applications/TubeHunter.app/Contents/Resources/TubeHunter.icns"),
+                                 HERE / "TubeHunter.app/Contents/Resources/TubeHunter.icns"):
+                        if icns.exists():
+                            img = NSImage.alloc().initWithContentsOfFile_(str(icns))
+                            if img:
+                                NSApplication.sharedApplication().setApplicationIconImage_(img)
+                            break
+                NSOperationQueue.mainQueue().addOperationWithBlock_(apply)
+            except Exception:
+                pass
+
+        webview.start(private_mode=False, storage_path=str(storage), func=_cocoa_identity)
         return
 
     # Fallback: run the server in the foreground and open the URL in the
