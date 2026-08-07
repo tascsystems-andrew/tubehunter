@@ -1295,6 +1295,21 @@ INDEX_HTML = r"""<!doctype html>
     padding: 24px 30px; max-width: 540px; width: 92%; color: #222;
   }
   .cart-modal h2 { margin: 0 0 12px; font-size: 17px; }
+  .lib-modal { max-width: 620px; }
+  .lib-search {
+    width: 100%; box-sizing: border-box; margin-bottom: 10px;
+    padding: 6px 10px; font: inherit; font-size: 13px;
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .lib-list { max-height: 380px; overflow-y: auto; border: 1px solid #e6ebf1; border-radius: 6px; }
+  .lib-row { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #eef1f5; }
+  .lib-row:last-child { border-bottom: none; }
+  .lib-row:hover, .lib-row:focus {
+    background: linear-gradient(180deg, #6c8bd6, #3a63b8); color: #fff; outline: none;
+  }
+  .lib-row:hover .lib-meta, .lib-row:focus .lib-meta { color: #dbe6ff; }
+  .lib-name { font-weight: 600; font-size: 13px; }
+  .lib-meta { font-size: 11px; color: #666; margin-top: 1px; }
   .cart-modal-summary {
     background: #eef3ff; border-left: 3px solid #3a63b8;
     padding: 8px 12px; border-radius: 3px; margin-bottom: 10px;
@@ -1597,6 +1612,7 @@ async function boot() {
 // {ok, app: "filament-studio", api: [...]} — poll it so the sync button shows
 // whether a push will land live (amp recomputes) or fall back to a file.
 async function pingFilamentStudio() {
+  const was = state.fsLive;
   try {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 800);
@@ -1605,6 +1621,7 @@ async function pingFilamentStudio() {
     const j = r.ok ? await r.json() : null;
     state.fsLive = !!(j && j.ok && j.app === "filament-studio");
   } catch (e) { state.fsLive = false; }
+  if (was !== state.fsLive) renderBuildPicker();   // library… button appears/disappears
   const btn = document.getElementById("fsSync");
   if (btn) {
     btn.classList.toggle("live", !!state.fsLive);
@@ -1692,6 +1709,13 @@ async function importTargetDialog() {
     });
     if (!text) return;
   }
+  await importTargetDocument(text);
+}
+
+// Shared tail for every import path (file picker, FS library browser, future
+// live push): hand the document to the server, adopt the target it returns,
+// and give the amp its build.
+async function importTargetDocument(text) {
   try {
     const r = await fetch("/api/target/import", {
       method: "POST", headers: {"Content-Type": "application/json"},
@@ -2454,6 +2478,7 @@ function renderBuildPicker() {
       <button onclick="viewActiveBuild()" title="View this amp's build & shopping list">view</button>` : ""}
     <button onclick="promptNewBuild()" title="Start a new amp/build">+</button>
     <button onclick="importTargetDialog()" title="Import an amp designed in Filament Studio">import…</button>
+    ${state.fsLive ? `<button onclick="browseFilamentLibrary()" title="Browse Filament Studio's amp library and load any design">library…</button>` : ""}
   `;
   const sel = document.getElementById("buildSelect");
   if (sel) sel.addEventListener("change", async e => {
@@ -2802,6 +2827,82 @@ function buildSelections(id) {
           filament_source: (state.target?.slots || []).some(sl => sl.filament)},
     selections: sels,
   };
+}
+
+/* Filament Studio amp-library browser (needs FS 8767 endpoints:
+   GET /api/chains → [{id, name, description?, tubes?, stageCount?}]
+   GET /api/chain/<id> → full schemaVersion-1 chain export).
+   Lets us load ANY design from their database, not just the open one. */
+async function browseFilamentLibrary() {
+  if (!state.fsLive) {
+    flashToast("Filament Studio isn't running — start it to browse the amp library");
+    return;
+  }
+  let chains;
+  try {
+    const r = await fetch("http://127.0.0.1:8767/api/chains");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    chains = Array.isArray(j) ? j : (j.chains || []);
+  } catch (e) {
+    flashToast("Couldn't read the Filament Studio library — is its API up? (" + e.message + ")");
+    return;
+  }
+  if (!chains.length) { flashToast("Filament Studio's library came back empty"); return; }
+  showLibraryModal(chains);
+}
+
+function showLibraryModal(chains) {
+  const overlay = document.createElement("div");
+  overlay.className = "cart-overlay";
+  const row = c => {
+    const meta = [c.tubes && c.tubes.length ? c.tubes.join(" · ") : null,
+                  c.stageCount ? `${c.stageCount} stages` : null]
+                 .filter(Boolean).join(" — ");
+    return `<div class="lib-row" data-id="${escapeHtml(String(c.id))}" tabindex="0">
+        <div class="lib-name">${escapeHtml(c.name || String(c.id))}</div>
+        <div class="lib-meta">${escapeHtml(meta || c.description || "")}</div>
+      </div>`;
+  };
+  overlay.innerHTML = `
+    <div class="cart-modal lib-modal">
+      <h2>Filament Studio library <span class="sub">· ${chains.length} amp${chains.length===1?"":"s"}</span></h2>
+      <input class="lib-search" id="libSearch" placeholder="Filter by name or tube (e.g. EL84, Princeton)" autofocus>
+      <div class="lib-list" id="libList">${chains.map(row).join("")}</div>
+      <div class="cart-modal-actions">
+        <button class="cart-cancel-btn" id="libCancel">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector("#libCancel").addEventListener("click", close);
+  overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+  overlay.querySelector(".cart-modal").addEventListener("click", e => e.stopPropagation());
+
+  const search = overlay.querySelector("#libSearch");
+  search.addEventListener("input", () => {
+    const q = search.value.trim().toLowerCase();
+    for (const el of overlay.querySelectorAll(".lib-row")) {
+      el.style.display = !q || el.textContent.toLowerCase().includes(q) ? "" : "none";
+    }
+  });
+  setTimeout(() => search.focus(), 30);
+
+  const pick = async id => {
+    close();
+    flashToast("Loading from Filament Studio…");
+    try {
+      const r = await fetch("http://127.0.0.1:8767/api/chain/" + encodeURIComponent(id));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      await importTargetDocument(await r.text());
+    } catch (e) {
+      alert("Couldn't load that amp: " + e.message);
+    }
+  };
+  for (const el of overlay.querySelectorAll(".lib-row")) {
+    el.addEventListener("click", () => pick(el.dataset.id));
+    el.addEventListener("keydown", e => { if (e.key === "Enter") pick(el.dataset.id); });
+  }
 }
 
 async function pushSelectionsToFilament(id) {
