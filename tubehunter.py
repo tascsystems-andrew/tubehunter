@@ -3961,6 +3961,13 @@ def main():
     server.daemon_threads = True
     url = f"http://127.0.0.1:{port}/"
     print(f"TubeHunter serving on {url}", file=sys.stderr)
+    if port != PORT:
+        # The integration contract is port-specific: the store bookmarklet fetches
+        # 127.0.0.1:8765, and Filament Studio's CORS allowlist names it. On a
+        # fallback port those silently stop working, so say so loudly.
+        print(f"WARNING: port {PORT} was busy (another TubeHunter instance?). "
+              f"The store bookmarklet and Filament Studio integration both expect "
+              f"{PORT} and will not reach this instance.", file=sys.stderr)
 
     if "--refresh-now" in sys.argv:
         app.runner.start()
